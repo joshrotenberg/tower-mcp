@@ -3803,20 +3803,29 @@ async fn a_command_queued_while_the_loop_exits_is_released() {
         .connect_simple(FailingSendTransport)
         .await
         .unwrap();
-    let permit = client.command_tx.clone().reserve_owned().await.unwrap();
+    let permit = client
+        .session
+        .command_tx
+        .clone()
+        .reserve_owned()
+        .await
+        .unwrap();
 
     let failed: Result<serde_json::Value> =
         client.send_request("ping", &serde_json::json!({})).await;
     assert!(failed.is_err());
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        client.command_tx.closed(),
+        client.session.command_tx.closed(),
     )
     .await
     .expect("the message loop stops accepting commands");
 
     let (done_tx, done_rx) = oneshot::channel();
-    permit.send(LoopCommand::EndSession { done_tx });
+    permit.send(LoopCommand::ResetSession {
+        end_on_server: true,
+        done_tx,
+    });
     let released = tokio::time::timeout(std::time::Duration::from_secs(5), done_rx)
         .await
         .expect("a command queued while the loop exited is released");

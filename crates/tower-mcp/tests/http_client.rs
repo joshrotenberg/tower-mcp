@@ -6230,3 +6230,6 @@ async fn sse_lookalike_media_types_are_read_as_ordinary_bodies() {
         assert!(tools.tools.is_empty(), "{content_type}");
     }
 }
+
+#[path = "http_client/listener_expiry.rs"]
+mod listener_expiry;

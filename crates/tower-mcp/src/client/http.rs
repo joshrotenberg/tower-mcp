@@ -211,7 +211,9 @@ pub struct HttpClientConfig {
     /// Whether to support automatic session recovery on expiry.
     /// When enabled, HTTP 404 responses (with a session ID attached) and
     /// JSON-RPC -32005 errors trigger re-initialization. A 404 counts
-    /// whatever its body holds.
+    /// whatever its body holds. A 404 on the legacy notification listener
+    /// restores the session and listener. An outstanding request whose
+    /// execution is uncertain fails without replay.
     /// Default: `true`.
     pub session_recovery: bool,
     /// Maximum size in bytes buffered for a single SSE event.
@@ -478,7 +480,9 @@ pub struct HttpClientTransport {
     /// and cloned for the SSE background task.
     incoming_tx: mpsc::Sender<String>,
     /// Handle to the SSE background task, if running.
-    sse_task: Option<JoinHandle<()>>,
+    sse_task: Option<JoinHandle<Result<()>>>,
+    /// The next listener is replacing one that reported an expired session.
+    replacing_expired_listener: bool,
     /// In-flight POST response streams, keyed by their JSON-RPC request ID.
     ///
     /// Final `subscriptions/listen` requests stay here until cancelled or the
@@ -549,6 +553,7 @@ impl HttpClientTransport {
             incoming_rx: rx,
             incoming_tx: tx,
             sse_task: None,
+            replacing_expired_listener: false,
             request_tasks: HashMap::new(),
             initialize_request_id: None,
             last_event_id: Arc::new(RwLock::new(None)),
@@ -592,6 +597,7 @@ impl HttpClientTransport {
             incoming_rx: rx,
             incoming_tx: tx,
             sse_task: None,
+            replacing_expired_listener: false,
             request_tasks: HashMap::new(),
             initialize_request_id: None,
             last_event_id: Arc::new(RwLock::new(None)),
@@ -708,8 +714,10 @@ impl HttpClientTransport {
     ///
     /// By default, if the server returns a session expired error (HTTP 404
     /// with session ID or JSON-RPC -32005), the client will automatically
-    /// re-initialize and retry the failed operation. Call this to disable
-    /// that behavior and surface the error to the caller instead.
+    /// re-initialize. A request rejected by the server can then be retried.
+    /// If the listener reports expiry, requests already in flight fail
+    /// because the server may have executed them. Disabling recovery
+    /// surfaces the expiry without establishing a replacement session.
     pub fn disable_session_recovery(mut self) -> Self {
         self.config.session_recovery = false;
         self
@@ -895,11 +903,13 @@ impl HttpClientTransport {
         #[cfg(feature = "oauth-client")]
         let token_provider = self.token_provider.clone();
 
+        let replacement = std::mem::take(&mut self.replacing_expired_listener);
         self.sse_task = Some(tokio::spawn(async move {
             sse_stream_loop(SseLoopParams {
                 url,
                 client,
                 session_id,
+                replacement,
                 protocol_version,
                 tx,
                 last_event_id,
@@ -910,7 +920,7 @@ impl HttpClientTransport {
                 #[cfg(feature = "oauth-client")]
                 token_provider,
             })
-            .await;
+            .await
         }));
     }
 }
@@ -1385,6 +1395,9 @@ impl ClientTransport for HttpClientTransport {
             // Final requests are sessionless even when a transitional peer
             // incorrectly returns a legacy session header from discovery.
             self.session_id = None;
+            if let Some(listener) = self.sse_task.take() {
+                listener.abort();
+            }
         }
         if is_modern_request
             && method == Some("tools/list")
@@ -1923,7 +1936,22 @@ impl ClientTransport for HttpClientTransport {
     }
 
     async fn recv(&mut self) -> Result<Option<String>> {
-        match self.incoming_rx.recv().await {
+        let message = if let Some(listener) = &mut self.sse_task {
+            tokio::select! {
+                msg = self.incoming_rx.recv() => msg,
+                outcome = listener => {
+                    self.sse_task = None;
+                    if let Ok(Err(error)) = outcome {
+                        self.replacing_expired_listener = matches!(error, Error::SessionExpired);
+                        return Err(error);
+                    }
+                    self.incoming_rx.recv().await
+                }
+            }
+        } else {
+            self.incoming_rx.recv().await
+        };
+        match message {
             // All response paths converge here, including background final
             // POSTs. Normalize tools/list results on the transport-owning
             // task so validated x-mcp-header mappings are available to the
@@ -1985,11 +2013,14 @@ impl ClientTransport for HttpClientTransport {
         // Clear session state but keep the transport alive
         self.session_id = None;
         self.protocol_version = None;
-        *self.last_event_id.write().await = None;
-        *self.sse_retry_delay.write().await = None;
-
-        // Drain any stale messages from the channel
-        while self.incoming_rx.try_recv().is_ok() {}
+        // Isolate the new session even from a send that raced task abortion.
+        // Replies to server-initiated requests have no client request task:
+        // a late failure of one must not mark the replacement disconnected.
+        self.connected = Arc::new(AtomicBool::new(self.is_connected()));
+        self.last_event_id = Arc::new(RwLock::new(None));
+        self.sse_retry_delay = Arc::new(RwLock::new(None));
+        self.sse_reconnect_signal = Arc::new(Notify::new());
+        (self.incoming_tx, self.incoming_rx) = mpsc::channel(self.config.channel_capacity);
     }
 
     async fn end_session(&mut self) {
@@ -2345,6 +2376,7 @@ struct SseLoopParams {
     url: String,
     client: reqwest::Client,
     session_id: String,
+    replacement: bool,
     protocol_version: Option<String>,
     tx: mpsc::Sender<String>,
     last_event_id: Arc<RwLock<Option<String>>>,
@@ -2361,11 +2393,12 @@ struct SseLoopParams {
 /// Opens a GET request with `Accept: text/event-stream` and parses
 /// incoming SSE events. Events are pushed into the mpsc channel for
 /// `recv()` to return. Supports reconnection with `Last-Event-ID`.
-async fn sse_stream_loop(params: SseLoopParams) {
+async fn sse_stream_loop(params: SseLoopParams) -> Result<()> {
     let SseLoopParams {
         url,
         client,
         session_id,
+        mut replacement,
         protocol_version,
         tx,
         last_event_id,
@@ -2421,8 +2454,18 @@ async fn sse_stream_loop(params: SseLoopParams) {
 
         let response = match request.send().await {
             Ok(r) if r.status().is_success() => {
+                replacement = false;
                 reconnect_attempts = 0;
                 r
+            }
+            Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+                // A replacement session that immediately rejects its own GET
+                // must not turn a missing endpoint into an initialize loop.
+                if replacement {
+                    tracing::warn!("Replacement session expired on its initial listener GET");
+                    connected.store(false, Ordering::Release);
+                }
+                return Err(Error::SessionExpired);
             }
             Ok(r) => {
                 tracing::warn!(status = %r.status(), "SSE connection rejected");
@@ -2463,7 +2506,7 @@ async fn sse_stream_loop(params: SseLoopParams) {
                                     // instead of buffering without bound.
                                     tracing::error!(error = %e, "SSE stream terminated");
                                     connected.store(false, Ordering::Release);
-                                    return;
+                                    return Ok(());
                                 }
                             };
                             for event in events {
@@ -2474,7 +2517,7 @@ async fn sse_stream_loop(params: SseLoopParams) {
                                     *sse_retry_delay.write().await = Some(Duration::from_millis(retry_ms));
                                 }
                                 if !event.data.is_empty() && tx.send(event.data).await.is_err() {
-                                    return; // Channel closed, transport dropped
+                                    return Ok(()); // Channel closed, transport dropped
                                 }
                             }
                         }
@@ -2515,6 +2558,7 @@ async fn sse_stream_loop(params: SseLoopParams) {
         );
         tokio::time::sleep(delay).await;
     }
+    Ok(())
 }
 
 // =============================================================================

@@ -109,7 +109,7 @@ pub use websocket::{WebSocketClientConfig, WebSocketClientTransport};
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -217,6 +217,7 @@ enum LoopCommand {
     /// can cancel the request it sent (#1202). The loop previously owned the
     /// counter, which left callers with no way to name their own request.
     Request {
+        generation: u64,
         id: RequestId,
         method: String,
         params: serde_json::Value,
@@ -237,14 +238,18 @@ enum LoopCommand {
     /// Send a JSON-RPC notification (no JSON-RPC response expected; the
     /// completion channel reports whether the transport delivered it).
     Notify {
+        generation: u64,
         method: String,
         params: serde_json::Value,
         done_tx: oneshot::Sender<Result<()>>,
     },
     /// Reset the transport's session state for re-initialization.
-    ResetSession { done_tx: oneshot::Sender<()> },
-    /// End the session a failed `initialize` left behind (#1558).
-    EndSession { done_tx: oneshot::Sender<()> },
+    ResetSession {
+        /// Terminate a session left by a failed initialize on the server.
+        /// An already-expired session only needs local cleanup.
+        end_on_server: bool,
+        done_tx: oneshot::Sender<()>,
+    },
     /// Fulfil embedded MRTR requests through the configured client handler.
     ResolveInputs {
         requests: InputRequests,
@@ -421,10 +426,27 @@ impl Drop for SubscriptionHandle {
 /// # }
 /// ```
 pub struct McpClient {
-    /// Channel to send commands to the background loop.
-    command_tx: mpsc::Sender<LoopCommand>,
+    session: Arc<ClientSession>,
     /// Background task handle.
     task: Option<JoinHandle<()>>,
+    /// Server discovery result, when the final lifecycle is active.
+    discovery: RwLock<Option<DiscoverResult>>,
+    /// Current roots (shared with the loop for roots/list responses).
+    roots: Arc<RwLock<Vec<Root>>>,
+    /// Whether the transport supports session recovery.
+    supports_session_recovery: bool,
+    /// Maximum number of input-required rounds auto-driven per operation.
+    max_mrtr_rounds: usize,
+    /// Maximum number of pages one `list_all_*` call fetches.
+    max_list_pages: usize,
+    /// SEP-2549 final-protocol response cache.
+    response_cache: Arc<ClientResponseCache>,
+}
+
+/// Client-side state shared by request callers and the passive HTTP session recovery path.
+struct ClientSession {
+    /// Channel to send commands to the background loop.
+    command_tx: mpsc::Sender<LoopCommand>,
     /// Whether `initialize()` has been called successfully.
     initialized: AtomicBool,
     /// Server info (set after successful initialization).
@@ -437,24 +459,12 @@ pub struct McpClient {
     selected_protocol_version: RwLock<Option<String>>,
     /// Client identity repeated in final-protocol request metadata.
     client_info: RwLock<Option<Implementation>>,
-    /// Server discovery result, when the final lifecycle is active.
-    discovery: RwLock<Option<DiscoverResult>>,
-    /// Current roots (shared with the loop for roots/list responses).
-    roots: Arc<RwLock<Vec<Root>>>,
     /// Whether the transport is still connected.
-    connected: Arc<AtomicBool>,
-    /// Whether the transport supports session recovery.
-    supports_session_recovery: bool,
+    connected: AtomicBool,
     /// Client identity from the last successful legacy handshake, for recovery.
     recovery_client_info: RwLock<Option<Implementation>>,
     /// Lock to prevent concurrent session recovery attempts.
     recovery_lock: Mutex<()>,
-    /// Maximum number of input-required rounds auto-driven per operation.
-    max_mrtr_rounds: usize,
-    /// Maximum number of pages one `list_all_*` call fetches.
-    max_list_pages: usize,
-    /// SEP-2549 final-protocol response cache.
-    response_cache: Arc<ClientResponseCache>,
     /// Allocator for per-request progress tokens; `None` when the client did
     /// not opt into progress.
     progress_tokens: Option<Arc<AtomicI64>>,
@@ -464,7 +474,11 @@ pub struct McpClient {
     trace_context_provider: Option<TraceContextProvider>,
     /// Allocator for JSON-RPC request ids, shared with the message loop so
     /// caller-issued and loop-issued ids never collide.
-    next_request_id: Arc<AtomicI64>,
+    next_request_id: AtomicI64,
+    /// Incremented by the transport-owning loop whenever it resets a session.
+    generation: AtomicU64,
+    /// Set as soon as the message loop learns the current session has expired.
+    expired: AtomicBool,
 }
 
 /// Default page budget for one automatic list walk.
@@ -865,72 +879,75 @@ impl McpClient {
         } = settings;
         let supports_session_recovery = transport.supports_session_recovery();
         let (command_tx, command_rx) = mpsc::channel::<LoopCommand>(64);
-        let connected = Arc::new(AtomicBool::new(true));
+        let connected = AtomicBool::new(true);
         let roots = Arc::new(RwLock::new(roots));
         let response_cache = ClientResponseCache::new(cache_config);
 
-        let loop_connected = connected.clone();
         let loop_roots = roots.clone();
         let loop_response_cache = response_cache.clone();
-        let next_request_id = Arc::new(AtomicI64::new(1));
-        let loop_next_id = next_request_id.clone();
-
-        let task = tokio::spawn(async move {
-            message_loop(
-                transport,
-                handler,
-                command_rx,
-                loop_connected,
-                loop_roots,
-                loop_response_cache,
-                loop_next_id,
-            )
-            .await;
-        });
-
-        Ok(Self {
+        let next_request_id = AtomicI64::new(1);
+        let session = Arc::new(ClientSession {
             command_tx,
-            task: Some(task),
             initialized: AtomicBool::new(false),
             server_info: RwLock::new(None),
             capabilities,
             protocol_support,
             selected_protocol_version: RwLock::new(None),
             client_info: RwLock::new(None),
-            discovery: RwLock::new(None),
-            roots,
             connected,
-            supports_session_recovery,
             recovery_client_info: RwLock::new(None),
             recovery_lock: Mutex::new(()),
-            max_mrtr_rounds,
-            max_list_pages,
-            response_cache,
+            generation: AtomicU64::new(0),
+            expired: AtomicBool::new(false),
             progress_tokens: request_progress.then(|| Arc::new(AtomicI64::new(1))),
             request_log_level: RwLock::new(request_log_level),
             trace_context_provider,
             next_request_id,
+        });
+        let loop_session = session.clone();
+
+        let task = tokio::spawn(async move {
+            message_loop(
+                transport,
+                handler,
+                command_rx,
+                loop_session,
+                loop_roots,
+                loop_response_cache,
+            )
+            .await;
+        });
+
+        Ok(Self {
+            session,
+            task: Some(task),
+            discovery: RwLock::new(None),
+            roots,
+            supports_session_recovery,
+            max_mrtr_rounds,
+            max_list_pages,
+            response_cache,
         })
     }
 
     /// Check if the client has been initialized.
     pub fn is_initialized(&self) -> bool {
-        self.initialized.load(Ordering::Acquire)
+        self.session.initialized.load(Ordering::Acquire)
     }
 
     /// Check if the transport is still connected.
     pub fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::Acquire)
+        self.session.connected.load(Ordering::Acquire)
     }
 
     /// Get the server info (available after initialization).
     pub async fn server_info(&self) -> Option<InitializeResult> {
-        self.server_info.read().await.clone()
+        self.session.server_info.read().await.clone()
     }
 
     /// Return the exact ordered protocol implementations enabled for this client.
     pub fn protocol_support(&self) -> &ProtocolSupport {
-        &self.protocol_support
+        &self.session.protocol_support
     }
 
     /// Clear every cached final-protocol response held by this client.
@@ -960,7 +977,7 @@ impl McpClient {
     /// later MRTR rounds, retries, task operations, and subscription requests
     /// take a fresh snapshot.
     pub async fn set_request_log_level(&self, level: Option<LogLevel>) {
-        *self.request_log_level.write().await = level;
+        *self.session.request_log_level.write().await = level;
     }
 
     /// Return the number of response-cache entries held by this client.
@@ -975,7 +992,7 @@ impl McpClient {
 
     /// Get the protocol version selected for the discover-based lifecycle.
     pub async fn selected_protocol_version(&self) -> Option<String> {
-        self.selected_protocol_version.read().await.clone()
+        self.session.selected_protocol_version.read().await.clone()
     }
 
     /// Get the server info synchronously (best-effort, non-blocking).
@@ -984,7 +1001,7 @@ impl McpClient {
     /// initialization hasn't completed. Prefer [`server_info()`](Self::server_info)
     /// in async contexts.
     pub fn server_info_blocking(&self) -> Option<InitializeResult> {
-        self.server_info.try_read().ok()?.clone()
+        self.session.server_info.try_read().ok()?.clone()
     }
 
     /// Initialize the MCP connection.
@@ -1019,19 +1036,39 @@ impl McpClient {
     ) -> Result<InitializeResult> {
         // A failure of a repeat call leaves the established session alone;
         // only a handshake that never completed has a session to release.
-        let was_initialized = self.initialized.load(Ordering::Acquire);
+        let handshake = self.session.recovery_lock.lock().await;
+        if self.session.expired.load(Ordering::Acquire) && self.supports_session_recovery {
+            // A caller may have dropped the very first initialize before its
+            // identity could be saved for automatic recovery.
+            self.session.reset_transport(false).await?;
+        }
+        let generation = self.session.generation.load(Ordering::Acquire);
+        let was_initialized = self.session.initialized.load(Ordering::Acquire);
         let client_info = Implementation {
             name: client_name.to_string(),
             version: client_version.to_string(),
             ..Default::default()
         };
-        let result = self.initialize_once(client_info).await;
+        let result = self.session.initialize_once(client_info.clone()).await;
+        if matches!(result, Err(Error::SessionExpired))
+            && self.supports_session_recovery
+            && self.session.expired.load(Ordering::Acquire)
+        {
+            // The server issued a session id but the listener lost it before
+            // the first handshake completed. Its identity is already known.
+            *self.session.recovery_client_info.write().await = Some(client_info);
+            drop(handshake);
+            self.session.await_recovery(generation).await?;
+            return self.server_info().await.ok_or(Error::SessionExpired);
+        }
         if result.is_err() && !was_initialized {
-            self.end_abandoned_session().await;
+            self.session.end_abandoned_session().await;
         }
         result
     }
+}
 
+impl ClientSession {
     async fn initialize_once(&self, client_info: Implementation) -> Result<InitializeResult> {
         let params = InitializeParams {
             protocol_version: crate::protocol::LATEST_PROTOCOL_VERSION.to_string(),
@@ -1040,7 +1077,13 @@ impl McpClient {
             meta: None,
         };
 
-        let result: InitializeResult = self.send_request_once("initialize", &params).await?;
+        let result: InitializeResult = self
+            .send_request_once(
+                self.generation.load(Ordering::Acquire),
+                "initialize",
+                &params,
+            )
+            .await?;
 
         // The server picks the protocol version, not necessarily the one
         // offered. A response outside the initialize-lifecycle set this
@@ -1063,17 +1106,26 @@ impl McpClient {
         self.send_notification("notifications/initialized", &serde_json::json!({}))
             .await
             .map_err(|error| {
-                Error::Transport(format!(
-                    "failed to deliver notifications/initialized: {error}"
-                ))
+                if matches!(error, Error::SessionExpired) {
+                    error
+                } else {
+                    Error::Transport(format!(
+                        "failed to deliver notifications/initialized: {error}"
+                    ))
+                }
             })?;
+        if self.expired.load(Ordering::Acquire) {
+            return Err(Error::SessionExpired);
+        }
         *self.recovery_client_info.write().await = Some(params.client_info);
         *self.server_info.write().await = Some(result.clone());
         self.initialized.store(true, Ordering::Release);
 
         Ok(result)
     }
+}
 
+impl McpClient {
     /// Start the sessionless 2026-07-28 lifecycle with `server/discover`.
     ///
     /// This path is available only when the final implementation was compiled.
@@ -1094,9 +1146,10 @@ impl McpClient {
             version: client_version.to_string(),
             ..Default::default()
         };
-        *self.client_info.write().await = Some(client_info.clone());
+        *self.session.client_info.write().await = Some(client_info.clone());
 
         let mut candidate = self
+            .session
             .protocol_support
             .versions()
             .iter()
@@ -1112,13 +1165,13 @@ impl McpClient {
 
         loop {
             let params = DiscoverParams {
-                meta: Some(self.request_meta_for(&candidate, &client_info)),
+                meta: Some(self.session.request_meta_for(&candidate, &client_info)),
             };
             let cache_key = serde_json::to_string(&(
                 client_name,
                 client_version,
                 candidate.as_str(),
-                &self.capabilities,
+                &self.session.capabilities,
             ))
             .expect("discovery cache key is serializable");
             match self
@@ -1139,7 +1192,7 @@ impl McpClient {
                     // it's on the sessionless 2026-07-28 path while every
                     // later request still carries per-request `_meta` the
                     // server never asked for.
-                    let selected = self
+                    let selected = self.session
                         .protocol_support
                         .versions()
                         .iter()
@@ -1155,12 +1208,12 @@ impl McpClient {
                             Error::Transport(format!(
                                 "server offers no mutually supported version for server/discover; server: {:?}, client: {:?}; fall back to initialize",
                                 result.supported_versions,
-                                self.protocol_support.versions()
+                                self.session.protocol_support.versions()
                             ))
                         })?;
-                    *self.selected_protocol_version.write().await = Some(selected);
+                    *self.session.selected_protocol_version.write().await = Some(selected);
                     *self.discovery.write().await = Some(result.clone());
-                    self.initialized.store(true, Ordering::Release);
+                    self.session.initialized.store(true, Ordering::Release);
                     return Ok(result);
                 }
                 Err(Error::JsonRpc(error)) if error.code == -32022 && !retried_unsupported => {
@@ -1176,7 +1229,7 @@ impl McpClient {
                     // candidate at all -- accepting it here would repeat the
                     // bug in the success branch above, just one round trip
                     // earlier.
-                    candidate = self
+                    candidate = self.session
                         .protocol_support
                         .versions()
                         .iter()
@@ -1190,7 +1243,7 @@ impl McpClient {
                         .ok_or_else(|| {
                             Error::Transport(format!(
                                 "server offers no mutually supported version for server/discover; server: {supported:?}, client: {:?}; fall back to initialize",
-                                self.protocol_support.versions()
+                                self.session.protocol_support.versions()
                             ))
                         })?;
                     retried_unsupported = true;
@@ -1289,7 +1342,7 @@ impl McpClient {
     ) -> Result<CallToolResult> {
         let mut input_responses = None;
         let mut request_state = None;
-        let mut schema_retry_available = self.uses_final_protocol().await;
+        let mut schema_retry_available = self.session.uses_final_protocol().await;
         for round in 0..=self.max_mrtr_rounds {
             let params = CallToolParams {
                 name: name.to_string(),
@@ -1377,7 +1430,7 @@ impl McpClient {
             meta: None,
             task: None,
         };
-        let mut schema_retry_available = self.uses_final_protocol().await;
+        let mut schema_retry_available = self.session.uses_final_protocol().await;
         self.send_task_aware_tool_request_with_schema_retry(&params, &mut schema_retry_available)
             .await
     }
@@ -1402,7 +1455,7 @@ impl McpClient {
         ttl_ms: Option<u64>,
     ) -> Result<CreateTaskResult> {
         self.ensure_initialized()?;
-        if self.uses_final_protocol().await {
+        if self.session.uses_final_protocol().await {
             if ttl_ms.is_some() {
                 return Err(Error::Transport(
                     "ttl_ms is server-selected by the final Tasks extension".to_string(),
@@ -1445,7 +1498,7 @@ impl McpClient {
             meta: None,
             task: Some(TaskRequestParams { ttl: ttl_ms }),
         };
-        let mut schema_retry_available = self.uses_final_protocol().await;
+        let mut schema_retry_available = self.session.uses_final_protocol().await;
         self.send_tool_request_with_schema_retry(&params, &mut schema_retry_available)
             .await
     }
@@ -1463,7 +1516,7 @@ impl McpClient {
     /// explains why the server refuses to tell them apart.
     pub async fn task_get(&self, task_id: &str) -> Result<TaskObject> {
         self.ensure_initialized()?;
-        if self.uses_final_protocol().await {
+        if self.session.uses_final_protocol().await {
             return Self::legacy_task_from_final(self.task_get_detailed(task_id).await?);
         }
         let params = GetTaskInfoParams {
@@ -1480,7 +1533,7 @@ impl McpClient {
     /// lifecycle; legacy callers should use [`task_get`](Self::task_get).
     pub async fn task_get_detailed(&self, task_id: &str) -> Result<crate::tasks::GetTaskResult> {
         self.ensure_initialized()?;
-        if !self.uses_final_protocol().await {
+        if !self.session.uses_final_protocol().await {
             return Err(Error::Transport(
                 "task_get_detailed requires the 2026-07-28 client lifecycle".to_string(),
             ));
@@ -1502,7 +1555,7 @@ impl McpClient {
     /// task object are also tolerated.
     pub async fn task_cancel(&self, task_id: &str, reason: Option<String>) -> Result<()> {
         self.ensure_initialized()?;
-        if self.uses_final_protocol().await {
+        if self.session.uses_final_protocol().await {
             let params = crate::tasks::CancelTaskParams {
                 task_id: task_id.to_string(),
                 meta: None,
@@ -1537,7 +1590,7 @@ impl McpClient {
     /// [`task_get`](Self::task_get) to observe the resulting state.
     pub async fn task_update(&self, task_id: &str, input_responses: InputResponses) -> Result<()> {
         self.ensure_initialized()?;
-        if self.uses_final_protocol().await {
+        if self.session.uses_final_protocol().await {
             let params = crate::tasks::UpdateTaskParams {
                 task_id: task_id.to_string(),
                 input_responses,
@@ -1576,7 +1629,7 @@ impl McpClient {
     /// task, where each `notifications/tasks` carries the whole task and a
     /// completion arrives with its result already attached.
     pub async fn task_wait(&self, task_id: &str) -> Result<TaskObject> {
-        if self.uses_final_protocol().await {
+        if self.session.uses_final_protocol().await {
             let result = self.wait_for_final_task(task_id).await?;
             return Self::legacy_task_from_final(result);
         }
@@ -1598,7 +1651,8 @@ impl McpClient {
     /// Read a resource.
     pub async fn read_resource(&self, uri: &str) -> Result<ReadResourceResult> {
         self.ensure_initialized()?;
-        let cache_enabled = self.uses_final_protocol().await && self.response_cache.enabled();
+        let cache_enabled =
+            self.session.uses_final_protocol().await && self.response_cache.enabled();
         let generation = if cache_enabled {
             self.response_cache
                 .capture_generation("resources/read", uri)
@@ -1722,7 +1776,7 @@ impl McpClient {
         notifications: SubscriptionFilter,
     ) -> Result<SubscriptionHandle> {
         self.ensure_initialized()?;
-        if !self.uses_final_protocol().await {
+        if !self.session.uses_final_protocol().await {
             return Err(Error::Transport(
                 "subscriptions/listen requires the 2026-07-28 protocol".to_string(),
             ));
@@ -1737,13 +1791,14 @@ impl McpClient {
                 "failed to serialize subscriptions/listen params: {error}"
             ))
         })?;
-        let params = self.with_final_request_meta(params).await?;
-        let params = self.with_request_log_level(params).await;
-        let params = self.with_trace_context(params);
+        let params = self.session.with_final_request_meta(params).await?;
+        let params = self.session.with_request_log_level(params).await;
+        let params = self.session.with_trace_context(params);
         let (id_tx, id_rx) = oneshot::channel();
         let (acknowledgment_tx, acknowledgment_rx) = oneshot::channel();
         let (response_tx, response_rx) = oneshot::channel();
-        self.command_tx
+        self.session
+            .command_tx
             .send(LoopCommand::StartSubscription {
                 params,
                 id_tx,
@@ -1758,7 +1813,7 @@ impl McpClient {
 
         Ok(SubscriptionHandle {
             request_id,
-            command_tx: self.command_tx.clone(),
+            command_tx: self.session.command_tx.clone(),
             acknowledgment_rx: Some(acknowledgment_rx),
             response_rx: Some(response_rx),
             active: true,
@@ -1775,7 +1830,7 @@ impl McpClient {
     /// capabilities; one that does not will reject the request.
     pub async fn subscribe_resource(&self, uri: &str) -> Result<()> {
         self.ensure_initialized()?;
-        if self.uses_final_protocol().await {
+        if self.session.uses_final_protocol().await {
             return Err(Error::Transport(
                 "resources/subscribe was removed in 2026-07-28; use subscriptions/listen"
                     .to_string(),
@@ -1790,7 +1845,7 @@ impl McpClient {
     /// Stop receiving updates for a resource (`resources/unsubscribe`).
     pub async fn unsubscribe_resource(&self, uri: &str) -> Result<()> {
         self.ensure_initialized()?;
-        if self.uses_final_protocol().await {
+        if self.session.uses_final_protocol().await {
             return Err(Error::Transport(
                 "resources/unsubscribe was removed in 2026-07-28; use subscriptions/listen"
                     .to_string(),
@@ -2166,10 +2221,14 @@ impl McpClient {
             cursor,
             meta: None,
         };
-        self.send_with_session_recovery(METHOD_RESOURCES_DIRECTORY_READ, || async {
-            self.ensure_directory_read_supported().await?;
-            self.send_request_once(METHOD_RESOURCES_DIRECTORY_READ, &params)
-                .await
+        self.send_with_session_recovery(METHOD_RESOURCES_DIRECTORY_READ, |generation| {
+            let params = &params;
+            async move {
+                self.ensure_directory_read_supported().await?;
+                self.session
+                    .send_request_once(generation, METHOD_RESOURCES_DIRECTORY_READ, params)
+                    .await
+            }
         })
         .await
     }
@@ -2189,14 +2248,15 @@ impl McpClient {
                 .and_then(|settings| SkillsExtensionSettings::deserialize(settings).ok())
                 .is_some_and(|settings| settings.directory_read)
         };
-        let supported = if self.uses_final_protocol().await {
+        let supported = if self.session.uses_final_protocol().await {
             self.discovery
                 .read()
                 .await
                 .as_ref()
                 .is_some_and(|result| supports_directory_read(&result.capabilities))
         } else {
-            self.server_info
+            self.session
+                .server_info
                 .read()
                 .await
                 .as_ref()
@@ -2368,7 +2428,7 @@ impl McpClient {
 
     /// Ping the server.
     pub async fn ping(&self) -> Result<()> {
-        if self.uses_final_protocol().await {
+        if self.session.uses_final_protocol().await {
             return Err(Error::Transport(
                 "ping was removed from the 2026-07-28 core protocol".to_string(),
             ));
@@ -2435,7 +2495,7 @@ impl McpClient {
 
     /// Send a raw typed notification to the server.
     pub async fn notify<P: serde::Serialize>(&self, method: &str, params: &P) -> Result<()> {
-        self.send_notification(method, params).await
+        self.session.send_notification(method, params).await
     }
 
     /// Get the current roots.
@@ -2446,8 +2506,9 @@ impl McpClient {
     /// Set roots and notify the server if initialized.
     pub async fn set_roots(&self, roots: Vec<Root>) -> Result<()> {
         *self.roots.write().await = roots;
-        if self.is_initialized() && !self.uses_final_protocol().await {
-            self.send_notification(notifications::ROOTS_LIST_CHANGED, &serde_json::json!({}))
+        if self.is_initialized() && !self.session.uses_final_protocol().await {
+            self.session
+                .send_notification(notifications::ROOTS_LIST_CHANGED, &serde_json::json!({}))
                 .await?;
         }
         Ok(())
@@ -2456,8 +2517,9 @@ impl McpClient {
     /// Add a root and notify the server if initialized.
     pub async fn add_root(&self, root: Root) -> Result<()> {
         self.roots.write().await.push(root);
-        if self.is_initialized() && !self.uses_final_protocol().await {
-            self.send_notification(notifications::ROOTS_LIST_CHANGED, &serde_json::json!({}))
+        if self.is_initialized() && !self.session.uses_final_protocol().await {
+            self.session
+                .send_notification(notifications::ROOTS_LIST_CHANGED, &serde_json::json!({}))
                 .await?;
         }
         Ok(())
@@ -2471,8 +2533,9 @@ impl McpClient {
         let removed = roots.len() < initial_len;
         drop(roots);
 
-        if removed && self.is_initialized() && !self.uses_final_protocol().await {
-            self.send_notification(notifications::ROOTS_LIST_CHANGED, &serde_json::json!({}))
+        if removed && self.is_initialized() && !self.session.uses_final_protocol().await {
+            self.session
+                .send_notification(notifications::ROOTS_LIST_CHANGED, &serde_json::json!({}))
                 .await?;
         }
         Ok(removed)
@@ -2496,7 +2559,7 @@ impl McpClient {
     /// still awaiting a response is abandoned, which is fine for a process
     /// that is exiting anyway and wrong for one that keeps running.
     pub async fn shutdown(mut self) -> Result<()> {
-        let _ = self.command_tx.send(LoopCommand::Shutdown).await;
+        let _ = self.session.command_tx.send(LoopCommand::Shutdown).await;
         if let Some(task) = self.task.take() {
             let _ = task.await;
         }
@@ -2713,7 +2776,7 @@ impl McpClient {
         P: serde::Serialize,
         R: CacheableResponse,
     {
-        let cache_allowed = self.uses_final_protocol().await;
+        let cache_allowed = self.session.uses_final_protocol().await;
         self.send_cacheable_request_when(method, cache_key, params, cache_allowed)
             .await
     }
@@ -2817,8 +2880,8 @@ impl McpClient {
         method: &str,
         params: &P,
     ) -> Result<R> {
-        self.send_with_session_recovery(method, || async {
-            self.send_request_once(method, params).await
+        self.send_with_session_recovery(method, |generation| {
+            self.session.send_request_once(generation, method, params)
         })
         .await
     }
@@ -2826,26 +2889,30 @@ impl McpClient {
     async fn send_with_session_recovery<R, F>(
         &self,
         method: &str,
-        send: impl Fn() -> F,
+        send: impl Fn(u64) -> F,
     ) -> Result<R>
     where
         F: std::future::Future<Output = Result<R>>,
     {
-        let final_protocol = self.uses_final_protocol().await;
-        match send().await {
+        let final_protocol = self.session.uses_final_protocol().await;
+        let generation = self.session.generation.load(Ordering::Acquire);
+        match send(generation).await {
             Err(Error::SessionExpired)
                 if self.supports_session_recovery && !final_protocol && method != "initialize" =>
             {
                 tracing::info!(method = %method, "Session expired, attempting recovery");
-                self.recover_session().await?;
-                send().await
+                self.session.await_recovery(generation).await?;
+                send(self.session.generation.load(Ordering::Acquire)).await
             }
             other => other,
         }
     }
+}
 
+impl ClientSession {
     async fn send_request_once<P: serde::Serialize, R: serde::de::DeserializeOwned>(
         &self,
+        generation: u64,
         method: &str,
         params: &P,
     ) -> Result<R> {
@@ -2861,6 +2928,7 @@ impl McpClient {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(LoopCommand::Request {
+                generation,
                 id: id.clone(),
                 method: method.to_string(),
                 params: params_value,
@@ -2890,10 +2958,64 @@ impl McpClient {
             .map_err(|e| Error::Transport(format!("Failed to deserialize response: {}", e)))
     }
 
+    // Own the handshake independently of the caller. Dropping a request while
+    // reset or initialize is in progress must still leave a usable session.
+    fn start_recovery(self: &Arc<Self>, generation: u64) -> JoinHandle<Result<()>> {
+        let session = self.clone();
+        tokio::spawn(async move {
+            let result = session.recover_session(generation).await;
+            if let Err(error) = &result {
+                tracing::warn!(%error, "Session recovery failed");
+            }
+            result
+        })
+    }
+
+    async fn await_recovery(self: &Arc<Self>, generation: u64) -> Result<()> {
+        self.start_recovery(generation)
+            .await
+            .map_err(|error| Error::Transport(format!("Session recovery stopped: {error}")))?
+    }
+
+    /// End outstanding work as soon as the listener reports the loss. The
+    /// replacement handshake runs independently and can take considerably longer.
+    fn session_lost(
+        self: &Arc<Self>,
+        pending: &mut HashMap<RequestId, PendingRequest>,
+        recover: bool,
+    ) {
+        if self.expired.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.initialized.store(false, Ordering::Release);
+        for (_, request) in pending.drain() {
+            let error = if request.method == "initialize" {
+                Error::SessionExpired
+            } else {
+                Error::Transport(
+                    "Session expired while the request was in flight; its outcome is unknown"
+                        .into(),
+                )
+            };
+            let _ = request.response_tx.send(Err(error));
+        }
+        if recover {
+            drop(self.start_recovery(self.generation.load(Ordering::Acquire)));
+        }
+    }
+
     /// Recover from a session expiry by resetting the transport and re-initializing.
-    async fn recover_session(&self) -> Result<()> {
+    async fn recover_session(&self, generation: u64) -> Result<()> {
         // Serialize recovery attempts
         let _guard = self.recovery_lock.lock().await;
+
+        if generation != self.generation.load(Ordering::Acquire) {
+            return if self.initialized.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(Error::SessionExpired)
+            };
+        }
 
         let client_info = self
             .recovery_client_info
@@ -2902,19 +3024,7 @@ impl McpClient {
             .clone()
             .ok_or_else(|| Error::Transport("Cannot recover: never initialized".to_string()))?;
 
-        // Tell the message loop to reset the transport
-        let (done_tx, done_rx) = oneshot::channel();
-        self.command_tx
-            .send(LoopCommand::ResetSession { done_tx })
-            .await
-            .map_err(|_| Error::Transport("Connection closed".to_string()))?;
-        done_rx
-            .await
-            .map_err(|_| Error::Transport("Connection closed during recovery".to_string()))?;
-
-        // Clear initialized state
-        self.initialized.store(false, Ordering::Release);
-        *self.server_info.write().await = None;
+        self.reset_transport(false).await?;
 
         tracing::info!("Re-initializing session after expiry");
         let result = self.initialize_once(client_info).await;
@@ -2930,15 +3040,21 @@ impl McpClient {
     /// and nothing else would end it short of the server's idle timeout.
     /// Best effort: a message loop that is already gone has nothing to end.
     async fn end_abandoned_session(&self) {
+        let _ = self.reset_transport(true).await;
+    }
+
+    async fn reset_transport(&self, end_on_server: bool) -> Result<()> {
         let (done_tx, done_rx) = oneshot::channel();
-        if self
-            .command_tx
-            .send(LoopCommand::EndSession { done_tx })
+        self.command_tx
+            .send(LoopCommand::ResetSession {
+                end_on_server,
+                done_tx,
+            })
             .await
-            .is_ok()
-        {
-            let _ = done_rx.await;
-        }
+            .map_err(|_| Error::Transport("Connection closed".into()))?;
+        done_rx
+            .await
+            .map_err(|_| Error::Transport("Connection closed during session reset".into()))
     }
 
     async fn send_notification<P: serde::Serialize>(&self, method: &str, params: &P) -> Result<()> {
@@ -2955,6 +3071,7 @@ impl McpClient {
         let (done_tx, done_rx) = oneshot::channel();
         self.command_tx
             .send(LoopCommand::Notify {
+                generation: self.generation.load(Ordering::Acquire),
                 method: method.to_string(),
                 params: params_value,
                 done_tx,
@@ -2966,18 +3083,20 @@ impl McpClient {
             .await
             .map_err(|_| Error::Transport("Connection closed".to_string()))?
     }
+}
 
+impl McpClient {
     async fn resolve_input_requests(&self, requests: InputRequests) -> Result<InputResponses> {
-        if !self.uses_final_protocol().await {
+        if !self.session.uses_final_protocol().await {
             return Err(Error::Transport(
                 "input_required results require the 2026-07-28 client lifecycle".to_string(),
             ));
         }
         for request in requests.values() {
             let declared = match request {
-                InputRequest::CreateMessage(_) => self.capabilities.sampling.is_some(),
-                InputRequest::ListRoots(_) => self.capabilities.roots.is_some(),
-                InputRequest::Elicit(_) => self.capabilities.elicitation.is_some(),
+                InputRequest::CreateMessage(_) => self.session.capabilities.sampling.is_some(),
+                InputRequest::ListRoots(_) => self.session.capabilities.roots.is_some(),
+                InputRequest::Elicit(_) => self.session.capabilities.elicitation.is_some(),
                 _ => false,
             };
             if !declared {
@@ -2989,7 +3108,8 @@ impl McpClient {
         }
 
         let (response_tx, response_rx) = oneshot::channel();
-        self.command_tx
+        self.session
+            .command_tx
             .send(LoopCommand::ResolveInputs {
                 requests,
                 response_tx,
@@ -3000,7 +3120,9 @@ impl McpClient {
             .await
             .map_err(|_| Error::Transport("Connection closed".to_string()))?
     }
+}
 
+impl ClientSession {
     async fn uses_final_protocol(&self) -> bool {
         self.selected_protocol_version.read().await.as_deref()
             == Some(crate::protocol::PROTOCOL_VERSION_2026_07_28)
@@ -3168,9 +3290,11 @@ impl McpClient {
         }
         Ok(())
     }
+}
 
+impl McpClient {
     fn ensure_initialized(&self) -> Result<()> {
-        if !self.initialized.load(Ordering::Acquire) {
+        if !self.session.initialized.load(Ordering::Acquire) {
             return Err(Error::Transport("Client not initialized".to_string()));
         }
         Ok(())
@@ -3263,6 +3387,7 @@ struct ServerRequestOutcome {
 /// which would otherwise push that function past clippy's
 /// `too_many_arguments` limit.
 struct PendingState<'a> {
+    session: &'a Arc<ClientSession>,
     pending_requests: &'a mut HashMap<RequestId, PendingRequest>,
     pending_server_requests: &'a mut HashMap<RequestId, crate::context::CancellationToken>,
 }
@@ -3272,10 +3397,9 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
     mut transport: T,
     handler: H,
     mut command_rx: mpsc::Receiver<LoopCommand>,
-    connected: Arc<AtomicBool>,
+    session: Arc<ClientSession>,
     roots: Arc<RwLock<Vec<Root>>>,
     response_cache: Arc<ClientResponseCache>,
-    next_id: Arc<AtomicI64>,
 ) {
     let handler = Arc::new(handler);
     let mut pending_requests: HashMap<RequestId, PendingRequest> = HashMap::new();
@@ -3286,14 +3410,26 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
     // task's outcome comes back over server_request_tx.
     let mut pending_server_requests: HashMap<RequestId, crate::context::CancellationToken> =
         HashMap::new();
-    let (server_request_tx, mut server_request_rx) = mpsc::channel::<ServerRequestOutcome>(32);
+    let (mut server_request_tx, mut server_request_rx) = mpsc::channel::<ServerRequestOutcome>(32);
 
     loop {
         tokio::select! {
             // Commands from McpClient methods
             command = command_rx.recv() => {
                 match command {
-                    Some(LoopCommand::Request { id, method, params, response_tx }) => {
+                    Some(LoopCommand::Request { generation, id, method, params, response_tx }) => {
+                        // A queued request must not escape onto the wire between
+                        // reset and the replacement handshake.
+                        if session.expired.load(Ordering::Acquire)
+                            || generation != session.generation.load(Ordering::Acquire)
+                            || (generation > 0 && !session.initialized.load(Ordering::Acquire)
+                                && method != "initialize" && method != "server/discover")
+                        {
+                            let _ = response_tx.send(Err(Error::Transport(
+                                "Session expired before the request was sent".into()
+                            )));
+                            continue;
+                        }
 
                         let request = JsonRpcRequest::new(id.clone(), &method)
                             .with_params(params);
@@ -3326,7 +3462,7 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
                         acknowledgment_tx,
                         response_tx,
                     }) => {
-                        let id = RequestId::Number(next_id.fetch_add(1, Ordering::Relaxed));
+                        let id = RequestId::Number(session.next_request_id.fetch_add(1, Ordering::Relaxed));
                         let request = JsonRpcRequest::new(id.clone(), "subscriptions/listen")
                             .with_params(params);
                         let json = match serde_json::to_string(&request) {
@@ -3391,7 +3527,16 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
                             let _ = done_tx.send(result);
                         }
                     }
-                    Some(LoopCommand::Notify { method, params, done_tx }) => {
+                    Some(LoopCommand::Notify { generation, method, params, done_tx }) => {
+                        if generation != session.generation.load(Ordering::Acquire)
+                            || session.expired.load(Ordering::Acquire)
+                            || (session.generation.load(Ordering::Acquire) > 0
+                                && !session.initialized.load(Ordering::Acquire)
+                                && method != "notifications/initialized")
+                        {
+                            let _ = done_tx.send(Err(Error::SessionExpired));
+                            continue;
+                        }
                         let notification = JsonRpcNotification::new(&method)
                             .with_params(params);
                         let result = match serde_json::to_string(&notification) {
@@ -3412,18 +3557,27 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
                         let result = resolve_inputs_with_handler(&handler, &roots, requests).await;
                         let _ = response_tx.send(result);
                     }
-                    Some(LoopCommand::ResetSession { done_tx }) => {
-                        tracing::info!("Resetting transport session for re-initialization");
-                        transport.reset_session().await;
-                        // Fail any pending requests with session expired
-                        for (_, pending) in pending_requests.drain() {
-                            let _ = pending.response_tx.send(Err(Error::SessionExpired));
+                    Some(LoopCommand::ResetSession { end_on_server, done_tx }) => {
+                        tracing::info!(end_on_server, "Resetting transport session");
+                        session.initialized.store(false, Ordering::Release);
+                        *session.server_info.write().await = None;
+                        session.generation.fetch_add(1, Ordering::AcqRel);
+                        session.expired.store(false, Ordering::Release);
+                        // These POSTs may already have executed. Only a POST explicitly
+                        // rejected by the server is eligible for the caller's retry.
+                        fail_all_pending(&mut pending_requests,
+                            "Session expired while the request was in flight; its outcome is unknown");
+                        for (_, token) in pending_server_requests.drain() {
+                            token.cancel();
                         }
-                        let _ = done_tx.send(());
-                    }
-                    Some(LoopCommand::EndSession { done_tx }) => {
-                        tracing::info!("Ending the session left by a failed initialize");
-                        transport.end_session().await;
+                        // An old handler can finish concurrently with cancellation.
+                        // Its response and id must never reach the replacement session.
+                        (server_request_tx, server_request_rx) = mpsc::channel(32);
+                        if end_on_server {
+                            transport.end_session().await;
+                        } else {
+                            transport.reset_session().await;
+                        }
                         let _ = done_tx.send(());
                     }
                     Some(LoopCommand::Shutdown) | None => {
@@ -3440,6 +3594,7 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
                         handle_incoming(
                             &line,
                             PendingState {
+                                session: &session,
                                 pending_requests: &mut pending_requests,
                                 pending_server_requests: &mut pending_server_requests,
                             },
@@ -3454,6 +3609,15 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
                         tracing::info!("Transport closed (EOF)");
                         break;
                     }
+                    Err(Error::SessionExpired) if !session.uses_final_protocol().await => {
+                        let recover = transport.is_connected() && transport.supports_session_recovery();
+                        session.session_lost(&mut pending_requests, recover);
+                        if !recover {
+                            session.initialized.store(false, Ordering::Release);
+                            *session.server_info.write().await = None;
+                            break;
+                        }
+                    }
                     Err(e) => {
                         tracing::error!(error = %e, "Transport receive error");
                         break;
@@ -3467,7 +3631,8 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
             // directly; a cancelled request carries no response.
             Some(outcome) = server_request_rx.recv() => {
                 pending_server_requests.remove(&outcome.id);
-                if let Some(response) = outcome.response
+                if !session.expired.load(Ordering::Acquire)
+                    && let Some(response) = outcome.response
                     && let Ok(json) = serde_json::to_string(&response)
                     && let Err(e) = transport.send(&json).await
                 {
@@ -3480,7 +3645,7 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
     }
 
     // Cleanup
-    connected.store(false, Ordering::Release);
+    session.connected.store(false, Ordering::Release);
     fail_all_pending(&mut pending_requests, "Connection closed");
     // Stop any server-initiated request tasks still running; their reply
     // would have nowhere to go now that the loop is exiting.
@@ -3550,6 +3715,7 @@ async fn handle_incoming<T: ClientTransport, H: ClientHandler>(
     server_request_tx: &mpsc::Sender<ServerRequestOutcome>,
 ) {
     let PendingState {
+        session,
         pending_requests,
         pending_server_requests,
     } = state;
@@ -3573,8 +3739,12 @@ async fn handle_incoming<T: ClientTransport, H: ClientHandler>(
                 tracing::warn!(
                     "Session expired (-32005 with null id), failing all pending requests"
                 );
-                for (_, pending) in pending_requests.drain() {
-                    let _ = pending.response_tx.send(Err(Error::SessionExpired));
+                if transport.supports_session_recovery() && !session.uses_final_protocol().await {
+                    session.session_lost(pending_requests, true);
+                } else {
+                    for (_, pending) in pending_requests.drain() {
+                        let _ = pending.response_tx.send(Err(Error::SessionExpired));
+                    }
                 }
                 return;
             }

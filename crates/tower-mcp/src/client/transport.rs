@@ -58,7 +58,9 @@ pub trait ClientTransport: Send + 'static {
     /// Returns `Ok(Some(json))` for a message, `Ok(None)` for clean EOF/close,
     /// or `Err(...)` for transport errors.
     ///
-    /// Both non-message returns end the connection: the client's message loop
+    /// A transport with session recovery can return [`crate::Error::SessionExpired`]
+    /// to request a new legacy handshake when its listener loses the session.
+    /// Other non-message returns end the connection: the client's message loop
     /// stops reading and fails every pending request. Reserve them for the
     /// connection actually being over. A single message that arrives damaged,
     /// such as one the transport cannot decode, is not that; log it, drop it,
