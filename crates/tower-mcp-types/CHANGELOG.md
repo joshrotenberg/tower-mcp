@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.28.0] - 2026-11-24
+
+### Bug Fixes
+
+- [**breaking**] **types:** Preserve task wire extension fields. Use the `DetailedTask` constructors and add `..` to variant patterns that only need the typed fields. ([#1673](https://github.com/joshrotenberg/tower-mcp/pull/1673))
+
+### Features
+
+- **proxy:** Add `Error::ProxySetup` to preserve the cause of backend setup failures ([#1678](https://github.com/joshrotenberg/tower-mcp/pull/1678))
+
+
+
 ## [0.27.0] - 2026-11-16
 
 ### Bug Fixes

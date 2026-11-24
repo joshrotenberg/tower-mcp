@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.28.0] - 2026-11-24
+
+### Bug Fixes
+
+- **client:** Validate protocol during HTTP session recovery ([#1665](https://github.com/joshrotenberg/tower-mcp/pull/1665))
+- **oauth:** Bound OAuth and JWKS response bodies ([#1666](https://github.com/joshrotenberg/tower-mcp/pull/1666))
+- **http:** Close long-lived streams on graceful shutdown ([#1672](https://github.com/joshrotenberg/tower-mcp/pull/1672))
+- [**breaking**] **types:** Preserve task wire extension fields. Use the `DetailedTask` constructors and add `..` to variant patterns that only need the typed fields. ([#1673](https://github.com/joshrotenberg/tower-mcp/pull/1673))
+- **http:** Classify malformed POST bodies and invalid JSON-RPC messages ([#1674](https://github.com/joshrotenberg/tower-mcp/pull/1674))
+- **skills:** Align name validation, blob encoding and directory reads ([#1675](https://github.com/joshrotenberg/tower-mcp/pull/1675))
+- **skills:** Anchor on-disk loading to directory handles ([#1677](https://github.com/joshrotenberg/tower-mcp/pull/1677))
+
+### Features
+
+- **proxy:** Add opt-in backend setup deadlines and stream health results ([#1678](https://github.com/joshrotenberg/tower-mcp/pull/1678))
+
+
+
 ## [0.27.0] - 2026-11-16
 
 ### Bug Fixes
