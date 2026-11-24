@@ -263,7 +263,7 @@ async fn main() -> Result<(), tower_mcp::BoxError> {
                 .resource_documentation("https://github.com/joshrotenberg/tower-mcp");
             // The shared secret and disabled expiry check are only for local
             // experimentation. Use the `jwks` mode for a real deployment.
-            let validator = JwtValidator::from_secret(b"demo-secret-do-not-use-in-production")
+            let validator = JwtValidator::from_secret(b"demo-secret-do-not-use-in-production")?
                 .disable_exp_validation();
 
             let transport = HttpTransport::new(mcp_router).disable_origin_validation();

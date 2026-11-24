@@ -29,11 +29,12 @@ use super::token::TokenValidator;
 /// ```rust,no_run
 /// use tower_mcp::oauth::{OAuthLayer, JwtValidator, ProtectedResourceMetadata};
 ///
-/// let validator = JwtValidator::from_secret(b"my-secret");
+/// let validator = JwtValidator::from_secret(b"my-secret")?;
 /// let metadata = ProtectedResourceMetadata::new("https://mcp.example.com")
 ///     .authorization_server("https://auth.example.com");
 ///
 /// let layer = OAuthLayer::new(validator, metadata);
+/// # Ok::<(), tower_mcp::BoxError>(())
 /// ```
 #[derive(Clone)]
 pub struct OAuthLayer<V: TokenValidator> {
@@ -260,7 +261,9 @@ mod tests {
     }
 
     fn test_validator() -> crate::oauth::JwtValidator {
-        crate::oauth::JwtValidator::from_secret(b"test-secret").disable_exp_validation()
+        crate::oauth::JwtValidator::from_secret(b"test-secret")
+            .unwrap()
+            .disable_exp_validation()
     }
 
     fn test_metadata() -> ProtectedResourceMetadata {
@@ -278,7 +281,7 @@ mod tests {
         jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(b"test-secret"),
+            &jsonwebtoken::EncodingKey::from_secret(b"test-secret").unwrap(),
         )
         .unwrap()
     }
@@ -287,7 +290,7 @@ mod tests {
         jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
             claims,
-            &jsonwebtoken::EncodingKey::from_secret(b"test-secret"),
+            &jsonwebtoken::EncodingKey::from_secret(b"test-secret").unwrap(),
         )
         .unwrap()
     }
