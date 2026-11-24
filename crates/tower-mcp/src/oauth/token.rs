@@ -171,9 +171,7 @@ pub struct JwtValidator {
 impl JwtValidator {
     /// Create a default `Validation` with audience validation disabled.
     ///
-    /// By default, `jsonwebtoken::Validation` requires audience claims.
-    /// We disable this by default and only enable it when
-    /// [`expected_audience`](Self::expected_audience) is called.
+    /// Enable audience validation through [`expected_audience`](Self::expected_audience).
     fn default_validation(algorithm: Algorithm) -> Validation {
         let mut validation = Validation::new(algorithm);
         // Generic validation opts in here; OAuthLayer independently enforces
@@ -233,6 +231,8 @@ impl JwtValidator {
     pub fn expected_audience(mut self, audience: &str) -> Self {
         let mut validation = (*self.validation).clone();
         validation.set_audience(&[audience]);
+        validation.validate_aud = true;
+        validation.required_spec_claims.insert("aud".to_string());
         self.validation = Arc::new(validation);
         self
     }
@@ -274,6 +274,11 @@ impl TokenValidator for JwtValidator {
                 .map_err(|e| match e.kind() {
                     jsonwebtoken::errors::ErrorKind::ExpiredSignature => OAuthError::ExpiredToken,
                     jsonwebtoken::errors::ErrorKind::InvalidAudience => OAuthError::InvalidAudience,
+                    jsonwebtoken::errors::ErrorKind::MissingRequiredClaim(claim)
+                        if claim == "aud" =>
+                    {
+                        OAuthError::InvalidAudience
+                    }
                     _ => OAuthError::InvalidToken {
                         description: e.to_string(),
                     },
@@ -1092,6 +1097,36 @@ mod tests {
         assert_eq!(validated.sub.as_deref(), Some("user123"));
         assert!(validated.has_scope("mcp:read"));
         assert!(validated.has_scope("mcp:write"));
+    }
+
+    #[tokio::test]
+    async fn jwt_validator_requires_a_matching_audience_when_configured() {
+        let secret = b"test-secret";
+        let key = jsonwebtoken::EncodingKey::from_secret(secret).unwrap();
+        let header = jsonwebtoken::Header::new(Algorithm::HS256);
+        let sign = |claims| jsonwebtoken::encode(&header, &claims, &key).unwrap();
+        let expected = "https://mcp.example.com";
+        let validator = JwtValidator::from_secret(secret).unwrap();
+        let scoped = validator.clone().expected_audience(expected);
+
+        for claims in [
+            serde_json::json!({"aud": expected}),
+            serde_json::json!({"aud": ["https://other.example.com", expected]}),
+        ] {
+            assert!(scoped.validate_token(&sign(claims)).await.is_ok());
+        }
+
+        for claims in [
+            serde_json::json!({"aud": "https://other.example.com"}),
+            serde_json::json!({}),
+        ] {
+            let token = sign(claims);
+            assert!(matches!(
+                scoped.validate_token(&token).await,
+                Err(OAuthError::InvalidAudience)
+            ));
+            assert!(validator.validate_token(&token).await.is_ok());
+        }
     }
 
     #[tokio::test]
