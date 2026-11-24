@@ -157,9 +157,10 @@ pub trait TokenValidator: Clone + Send + Sync + 'static {
 /// use tower_mcp::oauth::JwtValidator;
 ///
 /// // HMAC-based validation
-/// let validator = JwtValidator::from_secret(b"my-secret-key")
+/// let validator = JwtValidator::from_secret(b"my-secret-key")?
 ///     .expected_audience("https://mcp.example.com")
 ///     .expected_issuer("https://auth.example.com");
+/// # Ok::<(), tower_mcp::BoxError>(())
 /// ```
 #[derive(Clone)]
 pub struct JwtValidator {
@@ -185,13 +186,17 @@ impl JwtValidator {
     }
 
     /// Create a validator from an HMAC secret.
-    pub fn from_secret(secret: &[u8]) -> Self {
-        let decoding_key = Arc::new(DecodingKey::from_secret(secret));
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the secret is empty.
+    pub fn from_secret(secret: &[u8]) -> Result<Self, jsonwebtoken::errors::Error> {
+        let decoding_key = Arc::new(DecodingKey::from_secret(secret)?);
         let validation = Arc::new(Self::default_validation(Algorithm::HS256));
-        Self {
+        Ok(Self {
             decoding_key,
             validation,
-        }
+        })
     }
 
     /// Create a validator from an RSA PEM-encoded public key.
@@ -867,7 +872,7 @@ mod tests {
         /// compact JWT requires.
         #[test]
         fn malformed_jwt_fails_cleanly(token in malformed_jwt()) {
-            let validator = JwtValidator::from_secret(b"property-test-secret");
+            let validator = JwtValidator::from_secret(b"property-test-secret").unwrap();
             let result = futures::executor::block_on(validator.validate_token(&token));
             let rejected_as_invalid = matches!(result, Err(OAuthError::InvalidToken { .. }));
             prop_assert!(rejected_as_invalid);
@@ -1055,10 +1060,17 @@ mod tests {
         assert!(!claims.is_expired());
     }
 
+    #[test]
+    fn jwt_validator_rejects_empty_hmac_secret() {
+        assert!(JwtValidator::from_secret(b"").is_err());
+    }
+
     #[tokio::test]
     async fn test_jwt_validator_hmac() {
         let secret = b"super-secret-key-for-testing-only";
-        let validator = JwtValidator::from_secret(secret).disable_exp_validation();
+        let validator = JwtValidator::from_secret(secret)
+            .unwrap()
+            .disable_exp_validation();
 
         // Create a valid token
         let claims = serde_json::json!({
@@ -1069,7 +1081,7 @@ mod tests {
         let token = jsonwebtoken::encode(
             &jsonwebtoken::Header::new(Algorithm::HS256),
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(secret),
+            &jsonwebtoken::EncodingKey::from_secret(secret).unwrap(),
         )
         .unwrap();
 
@@ -1084,7 +1096,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_jwt_validator_invalid_token() {
-        let validator = JwtValidator::from_secret(b"secret");
+        let validator = JwtValidator::from_secret(b"secret").unwrap();
         let result = validator.validate_token("not-a-jwt").await;
         assert!(result.is_err());
         assert!(matches!(result, Err(OAuthError::InvalidToken { .. })));
@@ -1099,11 +1111,13 @@ mod tests {
         let token = jsonwebtoken::encode(
             &jsonwebtoken::Header::new(Algorithm::HS256),
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(wrong_secret),
+            &jsonwebtoken::EncodingKey::from_secret(wrong_secret).unwrap(),
         )
         .unwrap();
 
-        let validator = JwtValidator::from_secret(secret).disable_exp_validation();
+        let validator = JwtValidator::from_secret(secret)
+            .unwrap()
+            .disable_exp_validation();
         let result = validator.validate_token(&token).await;
         assert!(matches!(result, Err(OAuthError::InvalidToken { .. })));
     }
@@ -1120,11 +1134,11 @@ mod tests {
         let token = jsonwebtoken::encode(
             &jsonwebtoken::Header::new(Algorithm::HS256),
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(secret),
+            &jsonwebtoken::EncodingKey::from_secret(secret).unwrap(),
         )
         .unwrap();
 
-        let validator = JwtValidator::from_secret(secret);
+        let validator = JwtValidator::from_secret(secret).unwrap();
         let result = validator.validate_token(&token).await;
         assert!(matches!(result, Err(OAuthError::ExpiredToken)));
     }
@@ -1324,14 +1338,14 @@ mod tests {
         keys.insert(
             Some("key-1".to_string()),
             CachedKey {
-                decoding_key: DecodingKey::from_secret(b"dummy"),
+                decoding_key: DecodingKey::from_secret(b"dummy").unwrap(),
                 algorithm: Algorithm::HS256,
             },
         );
         keys.insert(
             Some("key-2".to_string()),
             CachedKey {
-                decoding_key: DecodingKey::from_secret(b"dummy2"),
+                decoding_key: DecodingKey::from_secret(b"dummy2").unwrap(),
                 algorithm: Algorithm::HS384,
             },
         );
@@ -1356,7 +1370,7 @@ mod tests {
         keys.insert(
             Some("key-1".to_string()),
             CachedKey {
-                decoding_key: DecodingKey::from_secret(b"dummy"),
+                decoding_key: DecodingKey::from_secret(b"dummy").unwrap(),
                 algorithm: Algorithm::HS256,
             },
         );

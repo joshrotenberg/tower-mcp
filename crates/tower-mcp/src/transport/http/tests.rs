@@ -88,7 +88,7 @@ fn oauth_test_token(audience: &str, scope: &str) -> String {
             "aud": audience,
             "scope": scope,
         }),
-        &jsonwebtoken::EncodingKey::from_secret(b"resource-server-test-secret"),
+        &jsonwebtoken::EncodingKey::from_secret(b"resource-server-test-secret").unwrap(),
     )
     .unwrap()
 }
@@ -101,6 +101,7 @@ async fn oauth_resource_server_setup_is_path_aware_and_audience_bound() {
         .authorization_server("https://auth.example.com")
         .scope("mcp:read");
     let validator = crate::oauth::JwtValidator::from_secret(b"resource-server-test-secret")
+        .unwrap()
         .disable_exp_validation();
     let app = HttpTransport::new(create_test_router())
         .disable_origin_validation()
@@ -276,7 +277,7 @@ async fn oauth_validate_adapter_missing_audience_is_rejected() {
 #[test]
 fn oauth_resource_server_setup_validates_metadata() {
     let result = HttpTransport::new(create_test_router()).into_oauth_router(
-        crate::oauth::JwtValidator::from_secret(b"secret"),
+        crate::oauth::JwtValidator::from_secret(b"secret").unwrap(),
         crate::oauth::ProtectedResourceMetadata::new("https://mcp.example.com"),
         crate::oauth::ScopePolicy::new(),
     );

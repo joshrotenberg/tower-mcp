@@ -37,6 +37,11 @@ The three OAuth roles stay separate:
 
 ## Protect an MCP server
 
+To migrate an HMAC validator, use `let validator = JwtValidator::from_secret(secret)?;`
+at server startup. An empty secret now returns an error during setup.
+If your application uses `jsonwebtoken::Algorithm` or `jsonwebtoken::errors::Error`
+with the validator, update its `jsonwebtoken` dependency to version 12.
+
 For production, prefer asymmetric access tokens and remote JWKS validation.
 The canonical resource URI must be the externally visible identifier clients
 use, including a path when that path distinguishes this MCP server.

@@ -968,7 +968,7 @@ mod tasks {
                 "aud": audience,
                 "scope": "mcp:read",
             }),
-            &jsonwebtoken::EncodingKey::from_secret(b"subscription-auth-test-secret"),
+            &jsonwebtoken::EncodingKey::from_secret(b"subscription-auth-test-secret").unwrap(),
         )
         .unwrap()
     }
@@ -1001,6 +1001,7 @@ mod tasks {
             .scope("mcp:read");
         let validator =
             tower_mcp::oauth::JwtValidator::from_secret(b"subscription-auth-test-secret")
+                .unwrap()
                 .disable_exp_validation();
         let (app, handle) = HttpTransport::new(task_router())
             .disable_origin_validation()

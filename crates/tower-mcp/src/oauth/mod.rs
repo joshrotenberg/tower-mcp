@@ -51,7 +51,7 @@
 //!         .scope("mcp:write");
 //!
 //!     // Configure token validator
-//!     let validator = JwtValidator::from_secret(b"shared-secret")
+//!     let validator = JwtValidator::from_secret(b"shared-secret")?
 //!         .expected_audience("https://mcp.example.com")
 //!         .expected_issuer("https://auth.example.com");
 //!
