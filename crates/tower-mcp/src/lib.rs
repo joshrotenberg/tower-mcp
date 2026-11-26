@@ -631,7 +631,7 @@ pub use async_task::{
 };
 pub use client::{
     ChannelTransport, ClientHandler, ClientTransport, McpClient, McpClientBuilder,
-    NotificationHandler, StdioClientTransport,
+    NotificationHandler, StdioClientTransport, ToolCallContext, ToolCallDecision, ToolCallPolicy,
 };
 #[cfg(feature = "http-client")]
 pub use client::{HttpClientConfig, HttpClientTransport, HttpStatusDetails};

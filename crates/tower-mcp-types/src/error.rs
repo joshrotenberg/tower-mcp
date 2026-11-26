@@ -502,6 +502,19 @@ pub enum Error {
     #[error("{0}")]
     Tool(#[from] ToolError),
 
+    /// A client-side policy rejected a tool-call attempt before dispatch.
+    #[error("Tool call '{name}' denied: {reason}")]
+    ToolCallDenied {
+        /// The raw MCP tool name.
+        name: String,
+        /// The policy's reason for the denial.
+        reason: String,
+    },
+
+    /// A connection generation change invalidated a tool-call policy decision.
+    #[error("Connection changed before the tool call could be sent")]
+    ToolCallContextChanged,
+
     /// The underlying transport failed or returned an unusable response.
     #[error("Transport error: {0}")]
     Transport(String),
