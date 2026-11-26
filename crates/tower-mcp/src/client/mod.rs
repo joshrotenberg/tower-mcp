@@ -133,7 +133,80 @@ use crate::protocol::{
     TaskStatusParams, ToolDefinition, UpdateTaskParams, notifications,
 };
 use response_cache::{CacheLookup, ClientResponseCache};
+use serde::Deserialize;
 use tower_mcp_types::JsonRpcError;
+
+/// Decides whether a client may dispatch a prepared tool call.
+///
+/// The client awaits this hook on the calling task. Implementations can await
+/// approval and may be called concurrently. See
+/// [`McpClientBuilder::tool_call_policy`] for coverage and decision lifetime.
+#[async_trait::async_trait]
+pub trait ToolCallPolicy: Send + Sync {
+    /// Decide whether to send this tool-call attempt.
+    async fn authorize(&self, call: ToolCallContext<'_>) -> ToolCallDecision;
+}
+
+#[async_trait::async_trait]
+impl<T: ToolCallPolicy + ?Sized> ToolCallPolicy for Arc<T> {
+    async fn authorize(&self, call: ToolCallContext<'_>) -> ToolCallDecision {
+        (**self).authorize(call).await
+    }
+}
+
+/// The prepared parameters and connection context for one tool-call attempt.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct ToolCallContext<'a> {
+    /// The MCP tool name as it appears in the request.
+    pub name: &'a str,
+    /// The arguments as serialized, including an explicit JSON null if present.
+    pub arguments: Option<&'a serde_json::Value>,
+    /// The complete serialized parameters, including request metadata and any
+    /// continuation fields. The client sends these parameters unchanged on allow.
+    pub params: &'a serde_json::Value,
+    /// Whether the request carries legacy task augmentation. Final-protocol
+    /// task creation is server-directed, so an ordinary call can return a task.
+    /// An explicit `"task": null` leaves this flag false and stays in `params`.
+    pub task_augmented: bool,
+    /// The negotiated MCP version, if a lifecycle handshake has completed.
+    pub protocol_version: Option<&'a str>,
+    /// The client-local generation, advanced by legacy session resets.
+    pub connection_generation: u64,
+}
+
+impl<'a> ToolCallContext<'a> {
+    /// Construct a context from prepared parameters, for example to unit-test
+    /// a policy directly. Pass the raw tool name from those parameters.
+    pub fn new(
+        name: &'a str,
+        params: &'a serde_json::Value,
+        protocol_version: Option<&'a str>,
+        connection_generation: u64,
+    ) -> Self {
+        Self {
+            name,
+            arguments: params.get("arguments"),
+            params,
+            task_augmented: params["task"].is_object(),
+            protocol_version,
+            connection_generation,
+        }
+    }
+}
+
+/// The policy's decision for one prepared tool-call attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToolCallDecision {
+    /// Allow the client to dispatch the request.
+    Allow,
+    /// Reject the request locally.
+    Deny {
+        /// A caller-supplied reason suitable for returning in an error.
+        reason: String,
+    },
+}
 
 /// One response to a final-protocol `tools/call` request.
 ///
@@ -479,6 +552,7 @@ struct ClientSession {
     generation: AtomicU64,
     /// Set as soon as the message loop learns the current session has expired.
     expired: AtomicBool,
+    tool_call_policy: Option<Box<dyn ToolCallPolicy>>,
 }
 
 /// Default page budget for one automatic list walk.
@@ -518,6 +592,7 @@ struct ClientSettings {
     request_progress: bool,
     request_log_level: Option<LogLevel>,
     trace_context_provider: Option<TraceContextProvider>,
+    tool_call_policy: Option<Box<dyn ToolCallPolicy>>,
 }
 
 /// Builder for configuring and connecting an [`McpClient`].
@@ -569,6 +644,7 @@ pub struct McpClientBuilder {
     request_progress: bool,
     request_log_level: Option<LogLevel>,
     trace_context_provider: Option<TraceContextProvider>,
+    tool_call_policy: Option<Box<dyn ToolCallPolicy>>,
 }
 
 impl McpClientBuilder {
@@ -589,7 +665,64 @@ impl McpClientBuilder {
             request_progress: false,
             request_log_level: None,
             trace_context_provider: None,
+            tool_call_policy: None,
         }
+    }
+
+    /// Install an asynchronous policy for outbound `tools/call` requests.
+    ///
+    /// The policy is a client-side control. Servers remain responsible for
+    /// authorization, and sandboxing must be provided separately. Server tool
+    /// annotations carry no authority or guarantee about replay safety.
+    ///
+    /// | Path | Behavior with a policy |
+    /// | --- | --- |
+    /// | `call_tool`, `call_tool_text`, `call_tool_once`, `call_tool_once_task_aware`, `call_tool_as_task` | Check each outgoing `tools/call`. |
+    /// | `request("tools/call", ...)` | Check valid requests. Reject malformed parameters and a non-null `task` on 2026-07-28 locally. |
+    /// | `notify("tools/call", ...)` | Reject locally because `tools/call` requires a request ID. |
+    /// | MRTR, stale-schema retry, and legacy session replay | Check each new attempt. |
+    /// | Task lifecycle RPCs, other methods, and server callbacks | Outside the tool-call policy. |
+    /// | Transport-level HTTP redirects and OAuth challenge resends | Re-deliver the request as part of the same approved dispatch without another check. |
+    /// | Direct [`ClientTransport::send`] | Bypasses the client policy. |
+    ///
+    /// Decisions apply to one dispatch. On legacy session expiry before
+    /// dispatch, the client returns [`Error::SessionExpired`] or recovers and
+    /// asks the policy again if recovery is enabled. If a session reset has
+    /// already changed the generation, the old decision can fail with
+    /// [`Error::ToolCallContextChanged`]. When a session expires while a
+    /// decision is pending, which of the two the caller sees depends on
+    /// whether recovery finished before the decision returned. In both cases
+    /// nothing was sent.
+    ///
+    /// The generation tracks legacy session resets, including failed
+    /// `initialize` cleanup. The 2026-07-28 lifecycle is sessionless.
+    /// Tool-list changes, repeated `discover` or `initialize` calls without
+    /// a reset, and a different server behind the same final-protocol endpoint
+    /// leave pending decisions in effect. Callers must track any tool or
+    /// server identity changes that matter to their policy.
+    ///
+    /// ```rust
+    /// use tower_mcp::{McpClient, ToolCallContext, ToolCallDecision, ToolCallPolicy};
+    ///
+    /// struct ListOnly;
+    ///
+    /// #[async_trait::async_trait]
+    /// impl ToolCallPolicy for ListOnly {
+    ///     async fn authorize(&self, call: ToolCallContext<'_>) -> ToolCallDecision {
+    ///         match call.name {
+    ///             "files/list" => ToolCallDecision::Allow,
+    ///             _ => ToolCallDecision::Deny {
+    ///                 reason: "Only files/list is enabled".into(),
+    ///             },
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// let builder = McpClient::builder().tool_call_policy(ListOnly);
+    /// ```
+    pub fn tool_call_policy(mut self, policy: impl ToolCallPolicy + 'static) -> Self {
+        self.tool_call_policy = Some(Box::new(policy));
+        self
     }
 
     /// Ask servers to report progress for this client's requests.
@@ -816,6 +949,7 @@ impl McpClientBuilder {
                 request_progress: self.request_progress,
                 request_log_level: self.request_log_level,
                 trace_context_provider: self.trace_context_provider,
+                tool_call_policy: self.tool_call_policy,
             },
         )
         .await
@@ -876,6 +1010,7 @@ impl McpClient {
             request_progress,
             request_log_level,
             trace_context_provider,
+            tool_call_policy,
         } = settings;
         let supports_session_recovery = transport.supports_session_recovery();
         let (command_tx, command_rx) = mpsc::channel::<LoopCommand>(64);
@@ -899,6 +1034,7 @@ impl McpClient {
             recovery_lock: Mutex::new(()),
             generation: AtomicU64::new(0),
             expired: AtomicBool::new(false),
+            tool_call_policy,
             progress_tokens: request_progress.then(|| Arc::new(AtomicI64::new(1))),
             request_log_level: RwLock::new(request_log_level),
             trace_context_provider,
@@ -2485,6 +2621,9 @@ impl McpClient {
     }
 
     /// Send a raw typed request to the server.
+    ///
+    /// A `tools/call` request is subject to any configured
+    /// [tool-call policy](McpClientBuilder::tool_call_policy).
     pub async fn request<P: serde::Serialize, R: serde::de::DeserializeOwned>(
         &self,
         method: &str,
@@ -2494,6 +2633,9 @@ impl McpClient {
     }
 
     /// Send a raw typed notification to the server.
+    ///
+    /// A client with a [tool-call policy](McpClientBuilder::tool_call_policy)
+    /// rejects `tools/call` notifications locally.
     pub async fn notify<P: serde::Serialize>(&self, method: &str, params: &P) -> Result<()> {
         self.session.send_notification(method, params).await
     }
@@ -2924,6 +3066,13 @@ impl ClientSession {
         let params_value = self.with_progress_token(params_value);
         let params_value = self.with_trace_context(params_value);
 
+        if method == "tools/call"
+            && let Some(policy) = &self.tool_call_policy
+        {
+            self.authorize_tool_call(policy.as_ref(), generation, &params_value)
+                .await?;
+        }
+
         let id = RequestId::Number(self.next_request_id.fetch_add(1, Ordering::Relaxed));
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
@@ -2956,6 +3105,65 @@ impl ClientSession {
 
         serde_json::from_value(result)
             .map_err(|e| Error::Transport(format!("Failed to deserialize response: {}", e)))
+    }
+
+    async fn authorize_tool_call(
+        &self,
+        policy: &dyn ToolCallPolicy,
+        generation: u64,
+        params: &serde_json::Value,
+    ) -> Result<()> {
+        let name = params
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| Error::invalid_params("tools/call requires a non-empty string name"))?;
+        let task_augmented = CallToolParams::deserialize(params)
+            .map_err(|_| Error::invalid_params("Malformed tools/call parameters"))?
+            .task
+            .is_some();
+        let selected = self.selected_protocol_version.read().await.clone();
+        let protocol_version = match selected {
+            Some(version) => Some(version),
+            None => self
+                .server_info
+                .read()
+                .await
+                .as_ref()
+                .map(|server| server.protocol_version.clone()),
+        };
+        let context = ToolCallContext::new(name, params, protocol_version.as_deref(), generation);
+        if task_augmented && !context.task_augmented {
+            return Err(Error::invalid_params("tools/call task must be an object"));
+        }
+        if task_augmented
+            && context.protocol_version == Some(crate::protocol::PROTOCOL_VERSION_2026_07_28)
+        {
+            return Err(Error::invalid_params(
+                "The final Tasks extension does not allow a 'task' request parameter",
+            ));
+        }
+        self.check_tool_call_session(generation)?;
+        let decision = policy.authorize(context).await;
+        self.check_tool_call_session(generation)?;
+
+        match decision {
+            ToolCallDecision::Allow => Ok(()),
+            ToolCallDecision::Deny { reason } => Err(Error::ToolCallDenied {
+                name: name.to_owned(),
+                reason,
+            }),
+        }
+    }
+
+    fn check_tool_call_session(&self, generation: u64) -> Result<()> {
+        if self.expired.load(Ordering::Acquire) {
+            return Err(Error::SessionExpired);
+        }
+        if generation != self.generation.load(Ordering::Acquire) {
+            return Err(Error::ToolCallContextChanged);
+        }
+        Ok(())
     }
 
     // Own the handshake independently of the caller. Dropping a request while
@@ -3058,6 +3266,11 @@ impl ClientSession {
     }
 
     async fn send_notification<P: serde::Serialize>(&self, method: &str, params: &P) -> Result<()> {
+        if method == "tools/call" && self.tool_call_policy.is_some() {
+            return Err(Error::JsonRpc(JsonRpcError::invalid_request(
+                "tools/call must be sent as a request",
+            )));
+        }
         self.ensure_connected()?;
         let params_value = serde_json::to_value(params)
             .map_err(|e| Error::Transport(format!("Failed to serialize params: {}", e)))?;
@@ -3420,14 +3633,20 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
                     Some(LoopCommand::Request { generation, id, method, params, response_tx }) => {
                         // A queued request must not escape onto the wire between
                         // reset and the replacement handshake.
-                        if session.expired.load(Ordering::Acquire)
-                            || generation != session.generation.load(Ordering::Acquire)
+                        let expired = session.expired.load(Ordering::Acquire);
+                        let generation_changed = generation != session.generation.load(Ordering::Acquire);
+                        if expired
+                            || generation_changed
                             || (generation > 0 && !session.initialized.load(Ordering::Acquire)
                                 && method != "initialize" && method != "server/discover")
                         {
-                            let _ = response_tx.send(Err(Error::Transport(
-                                "Session expired before the request was sent".into()
-                            )));
+                            let has_policy = method == "tools/call" && session.tool_call_policy.is_some();
+                            let error = match (has_policy, expired, generation_changed) {
+                                (true, true, _) => Error::SessionExpired,
+                                (true, false, true) => Error::ToolCallContextChanged,
+                                _ => Error::Transport("Session expired before the request was sent".into()),
+                            };
+                            let _ = response_tx.send(Err(error));
                             continue;
                         }
 

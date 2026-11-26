@@ -6,7 +6,6 @@
 use super::*;
 use async_trait::async_trait;
 use std::sync::Mutex;
-#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
 use std::time::Duration;
 
 /// Mock transport for testing that auto-responds to requests.
@@ -170,6 +169,597 @@ fn mock_initialize_response() -> serde_json::Value {
             "tools": {}
         }
     })
+}
+
+#[derive(Debug, PartialEq)]
+struct ReviewedToolCall {
+    name: String,
+    arguments: Option<serde_json::Value>,
+    params: serde_json::Value,
+    task_augmented: bool,
+    protocol_version: Option<String>,
+    generation: u64,
+}
+
+struct RecordingToolCallPolicy {
+    reviewed: Arc<Mutex<Vec<ReviewedToolCall>>>,
+    allow_count: usize,
+}
+
+#[async_trait]
+impl ToolCallPolicy for RecordingToolCallPolicy {
+    async fn authorize(&self, call: ToolCallContext<'_>) -> ToolCallDecision {
+        let mut reviewed = self.reviewed.lock().unwrap();
+        reviewed.push(ReviewedToolCall {
+            name: call.name.into(),
+            arguments: call.arguments.cloned(),
+            params: call.params.clone(),
+            task_augmented: call.task_augmented,
+            protocol_version: call.protocol_version.map(str::to_owned),
+            generation: call.connection_generation,
+        });
+        if reviewed.len() <= self.allow_count {
+            ToolCallDecision::Allow
+        } else {
+            ToolCallDecision::Deny {
+                reason: "blocked by test policy".into(),
+            }
+        }
+    }
+}
+
+fn outbound_tool_calls(outgoing: &Mutex<Vec<String>>) -> Vec<serde_json::Value> {
+    outgoing
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|frame| serde_json::from_str::<serde_json::Value>(frame).unwrap())
+        .filter(|frame| frame["method"] == "tools/call")
+        .collect()
+}
+
+fn assert_tool_call_denied<T: std::fmt::Debug>(result: Result<T>, expected_name: &str) {
+    match result.expect_err("expected a local policy denial") {
+        Error::ToolCallDenied { name, reason } => {
+            assert_eq!(name, expected_name);
+            assert_eq!(reason, "blocked by test policy");
+        }
+        error => panic!("unexpected error: {error:?}"),
+    }
+}
+
+#[tokio::test]
+async fn tool_call_policy_covers_legacy_helpers_and_raw_requests() {
+    use serde_json::json;
+
+    let name = "files/Write.v1";
+    let arguments = json!({"path": "notes.txt"});
+    let raw = json!({"name": name, "task": null, "_meta": {"example.com/context": 42}});
+    let ordinary = json!({"name": name, "arguments": arguments});
+    let once = json!({"name": name, "arguments": arguments, "requestState": "opaque"});
+    let task = json!({"name": name, "arguments": arguments, "task": {"ttl": 500}});
+    let expected = [&ordinary, &ordinary, &once, &ordinary, &task, &raw];
+
+    for allow in [false, true] {
+        let complete = json!({"content": [{"type": "text", "text": "done"}]});
+        let created = json!({"task": {
+            "taskId": "task-legacy", "status": "working", "ttl": 500,
+            "createdAt": "2026-07-31T00:00:00Z", "lastUpdatedAt": "2026-07-31T00:00:00Z"
+        }});
+        let transport = MockTransport::with_responses(vec![
+            mock_initialize_response(),
+            complete.clone(),
+            complete.clone(),
+            complete.clone(),
+            complete.clone(),
+            created,
+            complete,
+        ]);
+        let outgoing = transport.outgoing.clone();
+        let reviewed = Arc::new(Mutex::new(Vec::new()));
+        let client = McpClient::builder()
+            .tool_call_policy(RecordingToolCallPolicy {
+                reviewed: reviewed.clone(),
+                allow_count: if allow { expected.len() } else { 0 },
+            })
+            .connect_simple(transport)
+            .await
+            .unwrap();
+        client.initialize("test-client", "1.0.0").await.unwrap();
+        let initial_id = client.session.next_request_id.load(Ordering::Relaxed);
+
+        let results = [
+            client.call_tool(name, arguments.clone()).await.map(drop),
+            client
+                .call_tool_text(name, arguments.clone())
+                .await
+                .map(drop),
+            client
+                .call_tool_once(name, arguments.clone(), None, Some("opaque".into()))
+                .await
+                .map(drop),
+            client
+                .call_tool_once_task_aware(name, arguments.clone(), None, None)
+                .await
+                .map(drop),
+            client
+                .call_tool_as_task(name, arguments.clone(), Some(500))
+                .await
+                .map(drop),
+            client
+                .request::<_, CallToolResult>("tools/call", &raw)
+                .await
+                .map(drop),
+        ];
+
+        let reviewed = reviewed.lock().unwrap();
+        assert_eq!(reviewed.len(), expected.len());
+        for (call, params) in reviewed.iter().zip(expected) {
+            assert_eq!(&call.params, params);
+            assert_eq!(call.name, name);
+            assert_eq!(call.arguments.as_ref(), params.get("arguments"));
+            assert_eq!(call.task_augmented, params["task"].is_object());
+            assert_eq!(call.protocol_version.as_deref(), Some("2025-11-25"));
+            assert_eq!(call.generation, 0);
+        }
+        let frames = outbound_tool_calls(&outgoing);
+        if allow {
+            assert!(results.into_iter().all(|result| result.is_ok()));
+            assert_eq!(frames.len(), expected.len());
+            for (frame, params) in frames.iter().zip(expected) {
+                assert!(frame["id"].is_number());
+                assert_eq!(&frame["params"], params);
+            }
+        } else {
+            for result in results {
+                assert_tool_call_denied(result, name);
+            }
+            assert!(frames.is_empty());
+            assert_eq!(
+                client.session.next_request_id.load(Ordering::Relaxed),
+                initial_id
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn tool_call_policy_rejects_malformed_raw_requests_and_notifications() {
+    use serde_json::{Value, json};
+
+    let transport = MockTransport::with_responses(vec![mock_initialize_response(), json!({})]);
+    let outgoing = transport.outgoing.clone();
+    let reviewed = Arc::new(Mutex::new(Vec::new()));
+    let client = McpClient::builder()
+        .tool_call_policy(RecordingToolCallPolicy {
+            reviewed: reviewed.clone(),
+            allow_count: usize::MAX,
+        })
+        .connect_simple(transport)
+        .await
+        .unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    for params in [
+        json!(null),
+        json!(["files/list"]),
+        json!({}),
+        json!({"name": 123}),
+        json!({"name": ""}),
+        json!({"name": "files/list", "requestState": 123}),
+        json!({"name": "files/list", "task": {"ttl": "invalid"}}),
+        json!({"name": "files/list", "task": []}),
+    ] {
+        let result = client.request::<_, Value>("tools/call", &params).await;
+        assert!(
+            matches!(result, Err(Error::JsonRpc(error)) if error.code == ErrorCode::InvalidParams.code())
+        );
+    }
+    let result = client
+        .notify("tools/call", &json!({"name": "files/list"}))
+        .await;
+    assert!(
+        matches!(result, Err(Error::JsonRpc(error)) if error.code == ErrorCode::InvalidRequest.code())
+    );
+    client.ping().await.unwrap();
+
+    assert!(reviewed.lock().unwrap().is_empty());
+    assert!(outbound_tool_calls(&outgoing).is_empty());
+}
+
+#[tokio::test]
+async fn raw_tool_calls_reach_transport_without_a_policy() {
+    use serde_json::{Value, json};
+
+    let transport = MockTransport::with_responses(vec![mock_initialize_response(), json!({})]);
+    let outgoing = transport.outgoing.clone();
+    let client = McpClient::connect(transport).await.unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    let notification = json!({"name": "work"});
+    client.notify("tools/call", &notification).await.unwrap();
+    let malformed = json!({"name": 42});
+    let _: Value = client.request("tools/call", &malformed).await.unwrap();
+    let frames = outbound_tool_calls(&outgoing);
+    assert_eq!(frames.len(), 2);
+    assert!(frames[0].get("id").is_none());
+    assert_eq!(frames[0]["params"], notification);
+    assert!(frames[1]["id"].is_number());
+    assert_eq!(frames[1]["params"], malformed);
+}
+
+#[tokio::test]
+async fn tool_call_policy_rechecks_legacy_session_replay() {
+    for allow_replay in [false, true] {
+        let transport = MockTransport::with_replies(vec![
+            MockReply::Result(mock_initialize_response()),
+            MockReply::Error(JsonRpcError::session_not_found()),
+            MockReply::Result(mock_initialize_response()),
+            MockReply::Result(serde_json::json!({"content": []})),
+        ]);
+        let outgoing = transport.outgoing.clone();
+        let reviewed = Arc::new(Mutex::new(Vec::new()));
+        let mut client = McpClient::builder()
+            .request_progress()
+            .tool_call_policy(RecordingToolCallPolicy {
+                reviewed: reviewed.clone(),
+                allow_count: 1 + usize::from(allow_replay),
+            })
+            .connect_simple(transport)
+            .await
+            .unwrap();
+        client.supports_session_recovery = true;
+        client.initialize("test-client", "1.0.0").await.unwrap();
+
+        let result = client.call_tool("work", serde_json::json!({})).await;
+        let frames = outbound_tool_calls(&outgoing);
+        let reviewed = reviewed.lock().unwrap();
+        let [first, second] = reviewed.as_slice() else {
+            panic!("expected two policy decisions: {reviewed:?}");
+        };
+        assert_eq!(first.name, second.name);
+        assert_eq!(first.arguments, second.arguments);
+        assert_eq!(second.generation, first.generation + 1);
+        assert_ne!(
+            first.params["_meta"]["progressToken"],
+            second.params["_meta"]["progressToken"]
+        );
+        if allow_replay {
+            result.unwrap();
+            assert_eq!(frames.len(), 2);
+            assert_eq!(frames[1]["params"], second.params);
+        } else {
+            assert_tool_call_denied(result, "work");
+            assert_eq!(frames.len(), 1);
+        }
+        assert_eq!(frames[0]["params"], first.params);
+    }
+}
+
+#[derive(Default)]
+struct PendingToolCallPolicy {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl ToolCallPolicy for PendingToolCallPolicy {
+    async fn authorize(&self, _call: ToolCallContext<'_>) -> ToolCallDecision {
+        self.started.notify_one();
+        self.release.notified().await;
+        ToolCallDecision::Allow
+    }
+}
+
+#[tokio::test]
+async fn tool_call_policy_recovers_from_expiry_before_dispatch() {
+    for expires_during_approval in [false, true] {
+        let transport = MockTransport::with_responses(vec![
+            mock_initialize_response(),
+            mock_initialize_response(),
+            serde_json::json!({"content": [{"type": "text", "text": "done"}]}),
+        ]);
+        let outgoing = transport.outgoing.clone();
+        let policy = Arc::new(PendingToolCallPolicy::default());
+        let mut client = McpClient::builder()
+            .tool_call_policy(policy.clone())
+            .connect_simple(transport)
+            .await
+            .unwrap();
+        client.supports_session_recovery = true;
+        client.initialize("test-client", "1.0.0").await.unwrap();
+
+        let initial_generation = client.session.generation.load(Ordering::Acquire);
+        if !expires_during_approval {
+            client.session.expired.store(true, Ordering::Release);
+        }
+        let approval = async {
+            policy.started.notified().await;
+            if expires_during_approval {
+                assert_eq!(
+                    client.session.generation.load(Ordering::Acquire),
+                    initial_generation
+                );
+                client.session.expired.store(true, Ordering::Release);
+                policy.release.notify_one();
+                policy.started.notified().await;
+            }
+            assert_eq!(
+                client.session.generation.load(Ordering::Acquire),
+                initial_generation + 1
+            );
+            assert!(outbound_tool_calls(&outgoing).is_empty());
+            policy.release.notify_one();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(client.call_tool("work", serde_json::json!({})), approval)
+        })
+        .await
+        .expect("policy should be asked after recovery");
+        assert_eq!(result.unwrap().first_text(), Some("done"));
+        assert_eq!(outbound_tool_calls(&outgoing).len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn tool_call_policy_discards_pending_approval_on_reset() {
+    let transport = MockTransport::with_responses(vec![
+        mock_initialize_response(),
+        mock_initialize_response(),
+        serde_json::json!({"content": []}),
+    ]);
+    let outgoing = transport.outgoing.clone();
+    let policy = Arc::new(PendingToolCallPolicy::default());
+    let client = McpClient::builder()
+        .tool_call_policy(policy.clone())
+        .connect_simple(transport)
+        .await
+        .unwrap();
+    let initial_id = client.session.next_request_id.load(Ordering::Relaxed);
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    let reset = async {
+        policy.started.notified().await;
+        assert!(outbound_tool_calls(&outgoing).is_empty());
+        client.session.reset_transport(false).await.unwrap();
+        client.initialize("test-client", "1.0.0").await.unwrap();
+        policy.release.notify_one();
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client.call_tool("work", serde_json::json!({})), reset)
+    })
+    .await
+    .expect("approval and reset should both finish");
+    assert!(matches!(result, Err(Error::ToolCallContextChanged)));
+    assert!(outbound_tool_calls(&outgoing).is_empty());
+    assert_eq!(
+        client.session.next_request_id.load(Ordering::Relaxed),
+        initial_id + 2,
+        "only the initial and replacement initialize requests allocate IDs"
+    );
+}
+
+#[tokio::test]
+async fn tool_call_policy_discards_queued_approval_after_reset() {
+    let transport = MockTransport::with_responses(vec![
+        mock_initialize_response(),
+        serde_json::json!({"content": []}),
+    ]);
+    let outgoing = transport.outgoing.clone();
+    let reviewed = Arc::new(Mutex::new(Vec::new()));
+    let client = McpClient::builder()
+        .tool_call_policy(RecordingToolCallPolicy {
+            reviewed: reviewed.clone(),
+            allow_count: 1,
+        })
+        .connect_simple(transport)
+        .await
+        .unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    // Queue the reset and the approved request without yielding to the
+    // current-thread message loop. It will handle the reset first.
+    let command_tx = &client.session.command_tx;
+    let capacity = command_tx.capacity();
+    let (done_tx, done_rx) = oneshot::channel();
+    assert!(
+        command_tx
+            .try_send(LoopCommand::ResetSession {
+                end_on_server: false,
+                done_tx,
+            })
+            .is_ok()
+    );
+    let mut call = std::pin::pin!(client.call_tool("work", serde_json::json!({})));
+    tokio::select! {
+        biased;
+        result = &mut call => panic!("request finished before the message loop ran: {result:?}"),
+        _ = std::future::ready(()) => {}
+    }
+    assert_eq!(reviewed.lock().unwrap().len(), 1);
+    assert_eq!(command_tx.capacity(), capacity - 2);
+
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        done_rx.await.unwrap();
+        call.await
+    })
+    .await
+    .expect("message loop should reject the stale request");
+    assert!(matches!(result, Err(Error::ToolCallContextChanged)));
+    assert!(outbound_tool_calls(&outgoing).is_empty());
+}
+
+#[tokio::test]
+async fn pending_tool_call_policy_allows_other_traffic_and_can_be_cancelled() {
+    let transport = MockTransport::with_responses(vec![
+        mock_initialize_response(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    ]);
+    let outgoing = transport.outgoing.clone();
+    let policy = Arc::new(PendingToolCallPolicy::default());
+    let client = McpClient::builder()
+        .tool_call_policy(policy.clone())
+        .connect_simple(transport)
+        .await
+        .unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut call = std::pin::pin!(client.call_tool("work", serde_json::json!({})));
+        tokio::select! {
+            result = &mut call => panic!("tool call finished during approval: {result:?}"),
+            _ = async {
+                policy.started.notified().await;
+                client.ping().await.unwrap();
+            } => {}
+        }
+    })
+    .await
+    .expect("ping should finish while the approval is pending");
+    client.shutdown().await.unwrap();
+
+    let frames: Vec<_> = outgoing
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|frame| serde_json::from_str::<serde_json::Value>(frame).unwrap())
+        .collect();
+    assert!(frames.iter().any(|frame| frame["method"] == "ping"));
+    assert!(frames.iter().all(|frame| {
+        frame["method"] != "tools/call" && frame["method"] != "notifications/cancelled"
+    }));
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test]
+async fn tool_call_policy_covers_final_task_creation() {
+    use serde_json::json;
+
+    let name = "files/Write.v1";
+    for allow in [false, true] {
+        let transport = MockTransport::with_responses(vec![
+            final_discover_result(),
+            json!({
+                "resultType": "task",
+                "taskId": "task-final",
+                "status": "working",
+                "createdAt": "2026-07-31T00:00:00Z",
+                "lastUpdatedAt": "2026-07-31T00:00:00Z",
+                "ttlMs": null,
+                "pollIntervalMs": 50
+            }),
+        ]);
+        let outgoing = transport.outgoing.clone();
+        let reviewed = Arc::new(Mutex::new(Vec::new()));
+        let client = McpClient::builder()
+            .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .with_tasks()
+            .request_log_level(LogLevel::Warning)
+            .tool_call_policy(RecordingToolCallPolicy {
+                reviewed: reviewed.clone(),
+                allow_count: usize::from(allow),
+            })
+            .connect_simple(transport)
+            .await
+            .unwrap();
+        client.discover("test-client", "1.0.0").await.unwrap();
+        let invalid = client
+            .request::<_, serde_json::Value>("tools/call", &json!({"name": name, "task": {}}))
+            .await;
+        assert!(
+            matches!(invalid, Err(Error::JsonRpc(error)) if error.code == ErrorCode::InvalidParams.code())
+        );
+        let result = client.call_tool_as_task(name, json!(null), None).await;
+
+        let reviewed = reviewed.lock().unwrap();
+        let [call] = reviewed.as_slice() else {
+            panic!("expected one policy decision: {reviewed:?}");
+        };
+        assert_eq!(call.name, name);
+        assert_eq!(call.arguments, Some(json!(null)));
+        assert_eq!(call.protocol_version.as_deref(), Some("2026-07-28"));
+        assert!(!call.task_augmented);
+        assert!(call.params.get("task").is_none());
+        assert_eq!(
+            call.params["_meta"]["io.modelcontextprotocol/logLevel"],
+            "warning"
+        );
+        let frames = outbound_tool_calls(&outgoing);
+        if allow {
+            assert_eq!(result.unwrap().task.task_id, "task-final");
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0]["params"], call.params);
+        } else {
+            assert_tool_call_denied(result, name);
+            assert!(frames.is_empty());
+        }
+    }
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+#[tokio::test]
+async fn tool_call_policy_rechecks_mrtr_and_stale_schema_retry() {
+    use serde_json::json;
+
+    for mrtr in [false, true] {
+        let first_reply = if mrtr {
+            MockReply::Result(json!({
+                "resultType": "input_required",
+                "inputRequests": {"roots": {"method": "roots/list", "params": {}}},
+                "requestState": "opaque"
+            }))
+        } else {
+            MockReply::Error(JsonRpcError::header_mismatch("stale header mapping"))
+        };
+        let mut replies = vec![MockReply::Result(final_discover_result()), first_reply];
+        if !mrtr {
+            replies.push(MockReply::Result(cacheable_tools_result("work")));
+        }
+        replies.push(MockReply::Result(json!({
+            "resultType": "complete",
+            "content": [{"type": "text", "text": "done"}]
+        })));
+        let transport = MockTransport::with_replies(replies);
+        let outgoing = transport.outgoing.clone();
+        let reviewed = Arc::new(Mutex::new(Vec::new()));
+        let client = McpClient::builder()
+            .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .with_roots(vec![Root::new("file:///project")])
+            .tool_call_policy(RecordingToolCallPolicy {
+                reviewed: reviewed.clone(),
+                allow_count: 1,
+            })
+            .connect_simple(transport)
+            .await
+            .unwrap();
+        client.discover("test-client", "1.0.0").await.unwrap();
+        let result = client.call_tool("work", json!({"input": true})).await;
+
+        assert_tool_call_denied(result, "work");
+        let frames = outbound_tool_calls(&outgoing);
+        assert_eq!(frames.len(), 1);
+        let reviewed = reviewed.lock().unwrap();
+        let [first, second] = reviewed.as_slice() else {
+            panic!("expected two policy decisions: {reviewed:?}");
+        };
+        assert_eq!(frames[0]["params"], first.params);
+        assert_eq!(first.generation, second.generation);
+        assert_eq!(first.name, second.name);
+        assert_eq!(first.arguments, second.arguments);
+        if mrtr {
+            assert_eq!(second.params["requestState"], "opaque");
+            assert_eq!(
+                second.params["inputResponses"],
+                json!({"roots": {"roots": [{"uri": "file:///project"}]}})
+            );
+        } else {
+            assert_eq!(first.params, second.params);
+            assert!(outgoing.lock().unwrap().iter().any(|frame| {
+                serde_json::from_str::<serde_json::Value>(frame).unwrap()["method"] == "tools/list"
+            }));
+        }
+    }
 }
 
 /// #1174: a notification the transport fails to deliver must fail
