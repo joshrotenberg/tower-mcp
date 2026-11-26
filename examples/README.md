@@ -116,6 +116,7 @@ production checklist.
 |---------|---------------|
 | [sampling_server](sampling_server.rs) | Server-to-client LLM requests and elicitation |
 | [client_handler](client_handler.rs) | Client-side sampling and notification handling |
+| [host_mediated_input](host_mediated_input.rs) | Elicitation and sampling answered by a host UI or model: bounded queue, matching answers by id, deadlines, cancellation, on both lifecycles (`protocol-2026-07-28`) |
 | [external_notifications](external_notifications.rs) | Pushing MCP notifications from background tasks via `HttpTransport::with_notifications` |
 
 ### Dynamic Capabilities
