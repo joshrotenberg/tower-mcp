@@ -260,6 +260,51 @@ interaction. `call_tool` also waits for a final task result; use
 `call_tool_once_task_aware` or the task methods when you need direct lifecycle
 control.
 
+## Tool-call policy
+
+Install a [`ToolCallPolicy`](crate::client::ToolCallPolicy) with
+[`McpClientBuilder::tool_call_policy`](crate::client::McpClientBuilder::tool_call_policy)
+to apply application rules or await approval before sending a tool call. The
+hook sees the exact MCP tool name, the full prepared parameters, the negotiated
+protocol version if available, and the client's connection generation. The
+task-augmentation flag describes the legacy wire field. Final-protocol calls
+can create tasks even when the flag is false. An explicit `"task": null` also
+leaves the flag false and remains in the prepared parameters sent on approval.
+
+The hook covers all typed tool-call helpers and raw `request("tools/call", ...)`.
+With a policy installed, the client locally rejects malformed tool-call
+parameters, a non-null `task` on 2026-07-28, and `notify("tools/call", ...)`.
+A policy denial returns
+[`Error::ToolCallDenied`](crate::Error::ToolCallDenied) without sending that
+attempt. The client checks every MRTR round, stale-schema retry, and eligible
+replay after legacy reinitialization. If the legacy session expires before
+dispatch, the client returns [`Error::SessionExpired`](crate::Error::SessionExpired)
+or recovers and asks the policy again when recovery is enabled. A session reset
+that changes the generation can instead invalidate the pending decision with
+[`Error::ToolCallContextChanged`](crate::Error::ToolCallContextChanged).
+When a session expires while a decision is pending, which of the two the caller
+sees depends on whether recovery finished before the decision returned. In both
+cases nothing was sent.
+
+The generation tracks legacy session resets. The 2026-07-28 lifecycle is
+sessionless. Tool-list changes, repeated `discover` or `initialize` calls
+without a reset, and a different server behind the same final-protocol endpoint
+leave pending decisions in effect. The caller owns the server and principal
+identities, any remembered approvals, and any tracking of tool or server
+changes that affect its policy.
+
+HTTP redirects that preserve the request (307 and 308) and OAuth challenge
+resends happen below the hook. The transport re-delivers the request as part of
+the same approved dispatch without another check. Direct
+[`ClientTransport::send`](crate::client::ClientTransport::send) bypasses the hook.
+Task lifecycle RPCs, other MCP methods, and server callbacks are outside the
+tool-call policy.
+
+This is a client-side control. Servers remain responsible for authorization
+and sandboxing is a separate concern. Server tool annotations can inform what
+an application displays, but they confer no authority and provide no guarantee
+that a call is safe to replay.
+
 ## Response caching
 
 The built-in cache is consulted only after the 2026-07-28 lifecycle is active.
