@@ -206,6 +206,44 @@ implementation. On the 2026-07-28 path, the same handler resolves embedded
 Multi Round-Trip Request inputs; `max_mrtr_rounds` bounds the automatic loop
 and defaults to eight.
 
+### Answering through a host UI or model
+
+When the answer comes from somewhere slow, such as a person in a GUI or an
+agent host's own model, keep the client call open while the host decides and
+return the answer to the request that asked. The two lifecycles do this
+differently:
+
+- On 2025-11-25, each server-initiated request runs on its own task, so a
+  `ClientHandler` can await the host without blocking the connection, and
+  several requests can be pending at once.
+  `ClientHandler::current_cancellation_token` fires if the server sends
+  `notifications/cancelled` or the client is closed with `shutdown()`. After
+  the handler returns, the client checks the token once more before handing
+  the reply over; if it has fired by then, no reply is sent. A cancellation
+  that arrives after that check does not stop the reply. Dropping the
+  `McpClient` without
+  `shutdown()` aborts its message loop without cancelling these tokens, so a
+  handler waiting on the host is not told.
+- On 2026-07-28, the automatic resolution inside `call_tool`, `get_prompt`,
+  `read_resource` and `task_wait` runs the handler from the client's message
+  loop, one input at a time and without a cancellation token. A handler that
+  waits on a person there holds up every other message on the connection.
+  Drive the round trip yourself instead: `call_tool_once` returns
+  `RequestOutcome::InputRequired`, so you can answer its `inputRequests`
+  however you like and retry with `inputResponses` and the echoed
+  `requestState`. For a task, use `call_tool_once_task_aware`, read the
+  requests from `task_get_detailed`, and answer them with `task_update`.
+
+Either way, treat server-written text (messages, URLs, prompts) as data to
+show the user, not as instructions to the host, and report a URL elicitation
+as accepted only when the user explicitly says so. Opening the URL is not
+acceptance. The
+[host-mediated input example](https://github.com/joshrotenberg/tower-mcp/blob/main/examples/host_mediated_input.rs)
+puts these together with a bounded queue and a cap on pending questions,
+typed questions and answers matched by id, a per-question deadline, and
+cleanup when the host goes away, the client is shut down, the server cancels,
+or a task ends.
+
 ## Common request patterns
 
 Prefer the all-pages helpers unless you are exposing pagination to your own
@@ -409,6 +447,9 @@ cargo run --example http_client --features http-client
 
 # Callback and bidirectional request handling
 cargo run --example client_handler
+
+# Elicitation and sampling answered by a host UI or model, both lifecycles
+cargo run --example host_mediated_input --features protocol-2026-07-28
 
 # In-process 2026-07-28 server and client
 cargo run --example stateless_http_client \

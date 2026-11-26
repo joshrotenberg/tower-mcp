@@ -23,6 +23,10 @@ tower-resilience = { workspace = true, default-features = false, features = ["co
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[dev-dependencies]
+# Paused time for the deadline tests in host_mediated_input. Test builds only.
+tokio = { workspace = true, features = ["test-util"] }
+
 [features]
 default = []
 full = ["tower-mcp/full"]
@@ -193,6 +197,13 @@ path = "sampling_server.rs"
 [[example]]
 name = "client_handler"
 path = "client_handler.rs"
+
+# `test = true` so `cargo test --all-targets` runs the bridge tests inside it.
+[[example]]
+name = "host_mediated_input"
+path = "host_mediated_input.rs"
+required-features = ["protocol-2026-07-28"]
+test = true
 
 # --- Dynamic capabilities ---
 [[example]]

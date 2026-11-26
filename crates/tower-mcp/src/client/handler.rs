@@ -166,8 +166,21 @@ pub enum ServerNotification {
 /// [`current_cancellation_token()`](Self::current_cancellation_token) from
 /// within the handler to observe that and stop early (#1483).
 ///
+/// On the 2026-07-28 lifecycle there are no server-initiated requests. The
+/// automatic `input_required` handling in [`McpClient::call_tool`] and its
+/// siblings calls these same methods from the client's message loop, one input
+/// at a time, and without a cancellation token. A handler that waits on a
+/// person or an external host should drive that lifecycle with
+/// [`McpClient::call_tool_once`] or [`McpClient::call_tool_once_task_aware`]
+/// instead. The `host_mediated_input` example in the repository shows both
+/// lifecycles answered through a host's own UI or model.
+///
 /// The unit type `()` implements this trait with all defaults, which is
 /// used by [`McpClient::connect()`](super::McpClient::connect).
+///
+/// [`McpClient::call_tool`]: super::McpClient::call_tool
+/// [`McpClient::call_tool_once`]: super::McpClient::call_tool_once
+/// [`McpClient::call_tool_once_task_aware`]: super::McpClient::call_tool_once_task_aware
 #[async_trait]
 pub trait ClientHandler: Send + Sync + 'static {
     /// Handle a `sampling/createMessage` request from the server.
