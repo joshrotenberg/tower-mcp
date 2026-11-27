@@ -60,8 +60,9 @@
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
+#[cfg(feature = "stateless")]
+use std::sync::Mutex as StdMutex;
 
 use crate::context::{
     ChannelClientRequester, ClientRequesterHandle, NotificationReceiver, OutgoingRequestReceiver,
@@ -71,6 +72,9 @@ use crate::error::Result;
 use crate::jsonrpc::JsonRpcService;
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, McpNotification, RequestId};
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
+use crate::transport::pending::{
+    PendingClientRequests, abandon_channel, cancelled_notification_json,
+};
 use crate::transport::service::{CatchError, InjectAnnotations};
 #[cfg(feature = "stateless")]
 use crate::transport::stdio::{StdioSubscriptionInput, StdioSubscriptions};
@@ -84,12 +88,23 @@ use super::transport::ClientTransport;
 /// incoming JSON-RPC requests to a [`JsonRpcService<McpRouter>`] (one spawned
 /// task per request, so calls run concurrently) and pump server
 /// notifications into the response stream.
+///
+/// # Cancellation
+///
+/// A client's `notifications/cancelled` is not forwarded to the router, so
+/// cancelling a call from the client does not cancel its handler on this
+/// transport. In the other direction, a server-to-client request
+/// (sampling, elicitation) that its handler abandons after it was sent is
+/// cancelled with `notifications/cancelled` on the response stream.
 pub struct ChannelTransport {
     /// Send raw JSON messages to the server task.
     request_tx: mpsc::Sender<String>,
     /// Receive raw JSON responses and notification frames from the server tasks.
     response_rx: mpsc::Receiver<String>,
     connected: bool,
+    /// Fired by [`close`](ClientTransport::close): stops the server tasks and
+    /// releases handlers waiting on this client.
+    closed: tokio_util::sync::CancellationToken,
 }
 
 impl ChannelTransport {
@@ -215,48 +230,73 @@ impl ChannelTransport {
     {
         let (request_tx, mut request_rx) = mpsc::channel::<String>(64);
         let (response_tx, response_rx) = mpsc::channel::<String>(64);
+        let closed = tokio_util::sync::CancellationToken::new();
 
         // Server-initiated requests awaiting a client reply, keyed by the id
         // the requester allocated.
-        type PendingClientRequests = Arc<
-            StdMutex<HashMap<RequestId, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>,
-        >;
-        let pending: PendingClientRequests = Arc::new(StdMutex::new(HashMap::new()));
+        let pending = PendingClientRequests::new();
 
         // Outgoing request pump: serialize each server-initiated request onto
         // the shared stream and park its responder until the client answers.
+        // The same task emits `notifications/cancelled` for requests whose
+        // waiter gave up (#1705), so a cancellation never overtakes the
+        // request it cancels.
         let outgoing_out = response_tx.clone();
         let outgoing_pending = pending.clone();
+        let (abandon_tx, mut abandon_rx) = abandon_channel();
+        let pump_closed = closed.clone();
         tokio::spawn(async move {
-            while let Some(outgoing) = outgoing_rx.recv().await {
-                let frame = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": outgoing.id,
-                    "method": outgoing.method,
-                    "params": outgoing.params,
-                });
-                let Ok(json) = serde_json::to_string(&frame) else {
-                    let _ = outgoing.response_tx.send(Err(crate::error::Error::internal(
-                        "ChannelTransport: failed to serialize server request",
-                    )));
-                    continue;
-                };
-                if let Ok(mut pending) = outgoing_pending.lock() {
-                    pending.insert(outgoing.id.clone(), outgoing.response_tx);
-                } else {
-                    continue;
-                }
-                if outgoing_out.send(json).await.is_err() {
-                    // The client is gone; fail the request rather than leave
-                    // the handler awaiting a reply that cannot arrive.
-                    if let Ok(mut pending) = outgoing_pending.lock()
-                        && let Some(responder) = pending.remove(&outgoing.id)
-                    {
-                        let _ = responder.send(Err(crate::error::Error::internal(
-                            "ChannelTransport: client disconnected",
-                        )));
+            // However the pump ends, release every handler waiting on the
+            // client.
+            let _release_pending = outgoing_pending.clear_on_drop();
+            loop {
+                tokio::select! {
+                    // Cancellations first: one already reported goes out
+                    // before any request queued after it.
+                    biased;
+                    // The client dropped its end; nothing can answer.
+                    () = outgoing_out.closed() => return,
+                    // The client called `close()`.
+                    () = pump_closed.cancelled() => return,
+                    Some(id) = abandon_rx.recv() => {
+                        if let Some(json) = cancelled_notification_json(&id)
+                            && outgoing_out.send(json).await.is_err()
+                        {
+                            return;
+                        }
                     }
-                    return;
+                    outgoing = outgoing_rx.recv() => {
+                        let Some(outgoing) = outgoing else { break };
+                        let frame = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": outgoing.id,
+                            "method": outgoing.method,
+                            "params": outgoing.params,
+                        });
+                        let Ok(json) = serde_json::to_string(&frame) else {
+                            let _ = outgoing.response_tx.send(Err(crate::error::Error::internal(
+                                "ChannelTransport: failed to serialize server request",
+                            )));
+                            continue;
+                        };
+                        if !outgoing_pending.register(
+                            outgoing.id.clone(),
+                            outgoing.response_tx,
+                            abandon_tx.clone(),
+                        ) {
+                            continue;
+                        }
+                        if outgoing_out.send(json).await.is_err() {
+                            // The client is gone; fail the request rather than
+                            // leave the handler awaiting a reply that cannot
+                            // arrive.
+                            outgoing_pending.fail(
+                                std::slice::from_ref(&outgoing.id),
+                                "ChannelTransport: client disconnected",
+                            );
+                            return;
+                        }
+                    }
                 }
             }
         });
@@ -297,8 +337,16 @@ impl ChannelTransport {
             }
         });
 
+        let reader_closed = closed.clone();
         tokio::spawn(async move {
-            while let Some(raw_request) = request_rx.recv().await {
+            loop {
+                let raw_request = tokio::select! {
+                    raw_request = request_rx.recv() => raw_request,
+                    () = reader_closed.cancelled() => None,
+                };
+                let Some(raw_request) = raw_request else {
+                    break;
+                };
                 // Notifications carry no `id`, so they cannot parse as
                 // JsonRpcRequest (whose id is required). Inspect the raw
                 // frame first and handle them by method.
@@ -356,22 +404,17 @@ impl ChannelTransport {
                 // satisfy (JsonRpcRequest requires `method`).
                 if parsed.get("id").is_some() && crate::framing::is_response_frame(&parsed) {
                     if let Ok(id) = serde_json::from_value::<RequestId>(parsed["id"].clone()) {
-                        let responder = pending.lock().ok().and_then(|mut p| p.remove(&id));
-                        if let Some(responder) = responder {
-                            let result = if let Some(error) = parsed.get("error") {
-                                Err(crate::error::Error::internal(format!(
-                                    "Client error: {error}"
-                                )))
-                            } else {
-                                Ok(parsed
-                                    .get("result")
-                                    .cloned()
-                                    .unwrap_or(serde_json::Value::Null))
-                            };
-                            let _ = responder.send(result);
+                        let result = if let Some(error) = parsed.get("error") {
+                            Err(crate::error::Error::internal(format!(
+                                "Client error: {error}"
+                            )))
                         } else {
-                            tracing::warn!(?id, "ChannelTransport: reply for unknown request");
-                        }
+                            Ok(parsed
+                                .get("result")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null))
+                        };
+                        pending.complete(&id, result).log_undelivered(&id);
                     }
                     continue;
                 }
@@ -432,6 +475,10 @@ impl ChannelTransport {
                 });
             }
 
+            // The client dropped its sender or closed the transport, so no
+            // reply can arrive: release every handler still waiting on one.
+            pending.clear();
+
             // The client dropped its sender: any registered streams die with
             // the transport and cannot receive a terminal frame.
             #[cfg(feature = "stateless")]
@@ -444,6 +491,7 @@ impl ChannelTransport {
             request_tx,
             response_rx,
             connected: true,
+            closed,
         }
     }
 }
@@ -474,6 +522,7 @@ impl ClientTransport for ChannelTransport {
 
     async fn close(&mut self) -> Result<()> {
         self.connected = false;
+        self.closed.cancel();
         Ok(())
     }
 }

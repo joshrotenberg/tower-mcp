@@ -60,6 +60,8 @@ windows-sys = { version = "0.61", optional = true, features = ["Win32_Storage_Fi
 
 [dev-dependencies]
 async-trait.workspace = true
+# Paused time, so timeout tests advance the clock deterministically.
+tokio = { workspace = true, features = ["test-util"] }
 proptest = "1"
 tempfile = "3"
 tokio-test = "0.4"

@@ -1153,6 +1153,18 @@ impl McpRouter {
         self.inner.client_requester.as_ref()
     }
 
+    /// Whether a legacy (pre-2026-07-28) `initialize` has established this
+    /// session's lifecycle. Only that lifecycle permits server-initiated
+    /// requests.
+    pub(crate) fn legacy_lifecycle_established(&self) -> bool {
+        self.session.phase() != crate::session::SessionPhase::Uninitialized
+    }
+
+    /// Whether a 2026-07-28 request has been dispatched on this session.
+    pub(crate) fn final_traffic_seen(&self) -> bool {
+        self.session.final_traffic_seen()
+    }
+
     /// Add router-level state that handlers can access via the `Extension<T>` extractor.
     ///
     /// This is the recommended way to share state across all tools, resources, and prompts
@@ -1822,7 +1834,12 @@ impl McpRouter {
     ) -> Result<McpResponse> {
         // Enforce session state - reject requests before initialization
         let method = request.method_name();
-        if !is_final_protocol_request(&extensions) && !self.session.is_request_allowed(method) {
+        let final_protocol = is_final_protocol_request(&extensions);
+        if final_protocol {
+            // Lets transports tell a final-lifecycle peer apart (#1705).
+            self.session.mark_final_traffic();
+        }
+        if !final_protocol && !self.session.is_request_allowed(method) {
             tracing::warn!(
                 method = %method,
                 phase = ?self.session.phase(),

@@ -61,7 +61,7 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::task::JoinSet;
 
 use crate::context::{
@@ -84,6 +84,9 @@ use crate::protocol::{
     McpNotification, RequestId, notifications,
 };
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
+use crate::transport::pending::{
+    AbandonSender, PendingClientRequests, abandon_channel, cancelled_notification_json,
+};
 use crate::transport::service::{CatchError, InjectAnnotations};
 #[cfg(feature = "stateless")]
 use crate::transport::subscriptions::{
@@ -2235,11 +2238,6 @@ impl SyncStdioTransport {
 // Bidirectional stdio transport (with sampling support)
 // ============================================================================
 
-/// Pending request waiting for a response
-struct PendingRequest {
-    response_tx: oneshot::Sender<Result<serde_json::Value>>,
-}
-
 /// Bidirectional stdio transport with sampling support
 ///
 /// For legacy protocol requests, this transport supports both incoming
@@ -2289,12 +2287,15 @@ pub struct BidirectionalStdioTransport<S = McpRouter> {
     drain_timeout: Option<std::time::Duration>,
     service: JsonRpcService<S>,
     router: McpRouter,
-    /// Channel for receiving outgoing requests to send to the client
-    request_rx: OutgoingRequestReceiver,
+    /// Channel for receiving outgoing requests to send to the client.
+    ///
+    /// Each run holds it for its duration through a [`RunCleanup`], which
+    /// releases whatever is still queued however the run ends.
+    request_rx: Arc<Mutex<OutgoingRequestReceiver>>,
     /// Handle for handlers to send requests to the client
     client_requester: ClientRequesterHandle,
     /// Pending requests waiting for responses
-    pending_requests: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
+    pending_requests: PendingClientRequests,
     /// Channel for receiving server notifications to forward to the client
     notification_rx: NotificationReceiver,
     control_tx: mpsc::UnboundedSender<StdioControl>,
@@ -2323,9 +2324,9 @@ impl BidirectionalStdioTransport<McpRouter> {
         Self {
             service,
             router,
-            request_rx,
+            request_rx: Arc::new(Mutex::new(request_rx)),
             client_requester,
-            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            pending_requests: PendingClientRequests::new(),
             notification_rx,
             stopping: stopping_signal(),
             drain_timeout: None,
@@ -2475,6 +2476,17 @@ where
     /// setup. Final 2026-07-28 handlers do not receive it. This getter exposes
     /// the same handle for advanced callers that want to issue
     /// server-to-client requests directly on legacy connections.
+    ///
+    /// Only a legacy (pre-2026-07-28) lifecycle permits server-initiated
+    /// requests, so requests sent through this handle fail without being
+    /// written when the transport's protocol allow-list contains no legacy
+    /// version. When the allow-list contains both a legacy version and
+    /// 2026-07-28 (the default in a build with the `protocol-2026-07-28`
+    /// feature), requests are sent as before, both ahead of any traffic and
+    /// after a legacy `initialize`, but refused once the connection has
+    /// carried 2026-07-28 traffic without a legacy `initialize`. If the caller drops a
+    /// request that was already written, the transport sends the client
+    /// `notifications/cancelled` for it.
     pub fn client_requester(&self) -> ClientRequesterHandle {
         self.client_requester.clone()
     }
@@ -2508,6 +2520,17 @@ where
         let writer = Arc::new(Mutex::new(writer));
         let mut frames = FrameReader::with_max_len(reader, self.max_frame_len);
         let mut in_flight = JoinSet::new();
+        // This run's queue of server-to-client requests. However the run
+        // ends (end of input, an I/O error, or the future being dropped),
+        // the guard releases every handler waiting on the client, queued or
+        // already sent.
+        let mut run = RunCleanup {
+            requests: self.request_rx.clone().lock_owned().await,
+            pending: self.pending_requests.clone(),
+        };
+        // Cancellations belong to the run whose peer received the requests;
+        // a later run with a different peer never sees them.
+        let (abandon_tx, mut abandon_rx) = abandon_channel();
         // Parent of every request's own cancellation token, fired if the
         // drain gives up on them (#1557).
         let cancel = CancellationToken::new();
@@ -2549,8 +2572,23 @@ where
                 }
 
                 // Handle outgoing requests to send to the client
-                Some(outgoing) = self.request_rx.recv() => {
-                    self.send_outgoing_request(outgoing, writer.clone()).await?;
+                Some(outgoing) = run.requests.recv() => {
+                    self.send_outgoing_request(outgoing, &abandon_tx, writer.clone()).await?;
+                }
+
+                // Tell the client about server-to-client requests whose
+                // waiter gave up (#1705). Drained on this task, which also
+                // writes the requests, so a cancellation never overtakes
+                // its request.
+                Some(id) = abandon_rx.recv() => {
+                    if let Some(json) = cancelled_notification_json(&id) {
+                        trace_stdio_frame(
+                            StdioFrameDirection::Outbound,
+                            StdioFrameKind::Notification,
+                            json.len(),
+                        );
+                        self.write_line(&json, writer.clone()).await?;
+                    }
                 }
 
                 // Reap completed dispatches while the connection stays open.
@@ -2608,9 +2646,8 @@ where
 
         // No more client responses can arrive. Release both queued and already
         // sent requests so elicitation/sampling cannot deadlock the drain.
-        self.request_rx.close();
-        while self.request_rx.try_recv().is_ok() {}
-        self.pending_requests.lock().await.clear();
+        run.requests.close();
+        run.release();
 
         async fn join_all(in_flight: &mut JoinSet<()>) {
             while let Some(result) = in_flight.join_next().await {
@@ -2798,38 +2835,27 @@ where
             }
         };
 
-        let pending = {
-            let mut pending_requests = self.pending_requests.lock().await;
-            pending_requests.remove(&id)
+        let result = if let Some(error) = parsed.get("error") {
+            let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+            let message = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown error");
+            Err(Error::Internal(format!(
+                "Client error ({}): {}",
+                code, message
+            )))
+        } else if let Some(result) = parsed.get("result") {
+            Ok(result.clone())
+        } else {
+            Err(Error::Internal(
+                "Response has neither result nor error".to_string(),
+            ))
         };
 
-        match pending {
-            Some(pending) => {
-                let result = if let Some(error) = parsed.get("error") {
-                    let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-                    let message = error
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("Unknown error");
-                    Err(Error::Internal(format!(
-                        "Client error ({}): {}",
-                        code, message
-                    )))
-                } else if let Some(result) = parsed.get("result") {
-                    Ok(result.clone())
-                } else {
-                    Err(Error::Internal(
-                        "Response has neither result nor error".to_string(),
-                    ))
-                };
-
-                // Send result to waiter (ignore if they've dropped the receiver)
-                let _ = pending.response_tx.send(result);
-            }
-            None => {
-                tracing::warn!("Received response for unknown request");
-            }
-        }
+        self.pending_requests
+            .complete(&id, result)
+            .log_undelivered(&id);
 
         Ok(())
     }
@@ -2838,11 +2864,29 @@ where
     async fn send_outgoing_request<W>(
         &mut self,
         outgoing: OutgoingRequest,
+        abandon_tx: &AbandonSender,
         writer: Arc<Mutex<W>>,
     ) -> Result<()>
     where
         W: tokio::io::AsyncWrite + Unpin + Send,
     {
+        // The 2026-07-28 protocol forbids server-initiated requests. Handlers
+        // on that lifecycle never receive a requester, but the public
+        // `client_requester()` handle bypasses that gate, so check here.
+        if !direct_requests_permitted(
+            self.service.configured_protocol_support(),
+            self.router.legacy_lifecycle_established(),
+            self.router.final_traffic_seen(),
+        ) {
+            let _ = outgoing.response_tx.send(Err(Error::Internal(format!(
+                "Cannot send `{}` to the client: this connection is not on a legacy \
+                 (pre-2026-07-28) lifecycle, and 2026-07-28 forbids \
+                 server-initiated requests",
+                outgoing.method
+            ))));
+            return Ok(());
+        }
+
         // Build JSON-RPC request
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -2860,15 +2904,13 @@ where
             request_json.len(),
         );
 
-        // Store pending request
+        // Store pending request. A waiter that already gave up needs no
+        // request and no cancellation.
+        if !self
+            .pending_requests
+            .register(outgoing.id, outgoing.response_tx, abandon_tx.clone())
         {
-            let mut pending_requests = self.pending_requests.lock().await;
-            pending_requests.insert(
-                outgoing.id,
-                PendingRequest {
-                    response_tx: outgoing.response_tx,
-                },
-            );
+            return Ok(());
         }
 
         // Send the request
@@ -2883,6 +2925,50 @@ where
         W: tokio::io::AsyncWrite + Unpin + Send,
     {
         write_line_locked(&writer, line).await
+    }
+}
+
+/// Whether a server-to-client request may be written on this connection.
+///
+/// Only a legacy (pre-2026-07-28) lifecycle permits them. A transport that
+/// accepts no legacy version never sends one. One that accepts only legacy
+/// versions always may. One that accepts both may, as it always has, unless
+/// the connection has carried 2026-07-28 traffic without a legacy
+/// `initialize`, which shows the peer is on the final lifecycle.
+fn direct_requests_permitted(
+    support: &ProtocolSupport,
+    legacy_established: bool,
+    final_traffic_seen: bool,
+) -> bool {
+    let legacy = support
+        .versions()
+        .iter()
+        .any(|version| crate::protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&version.as_str()));
+    let final_enabled = support.contains(crate::protocol::PROTOCOL_VERSION_2026_07_28);
+    legacy && (!final_enabled || legacy_established || !final_traffic_seen)
+}
+
+/// One run's hold on the outgoing request queue.
+///
+/// Dropped however [`BidirectionalStdioTransport::run_with_streams`] ends,
+/// it releases every handler still waiting on the client: requests queued but
+/// never written are dropped, so their waiters see the channel close, and
+/// requests already written are cleared from the registry.
+struct RunCleanup {
+    requests: tokio::sync::OwnedMutexGuard<OutgoingRequestReceiver>,
+    pending: PendingClientRequests,
+}
+
+impl RunCleanup {
+    fn release(&mut self) {
+        while self.requests.try_recv().is_ok() {}
+        self.pending.clear();
+    }
+}
+
+impl Drop for RunCleanup {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 

@@ -963,6 +963,27 @@ impl RequestContext {
         self.client_requester.is_some()
     }
 
+    /// Await a server-to-client request unless this request is cancelled.
+    ///
+    /// On cancellation the request future is dropped, which releases its
+    /// response channel; the transport notices and sends the client
+    /// `notifications/cancelled` for it (#1705). An already-cancelled request
+    /// sends nothing: the future is not polled, so nothing reaches the client.
+    async fn await_client_request<T>(
+        &self,
+        what: &str,
+        request: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let cancelled = || Error::Internal(format!("{what} abandoned: the request was cancelled"));
+        if self.cancellation.is_cancelled() {
+            return Err(cancelled());
+        }
+        tokio::select! {
+            result = request => result,
+            () = self.cancellation.cancelled() => Err(cancelled()),
+        }
+    }
+
     /// Request an LLM completion from the client
     ///
     /// This sends a `sampling/createMessage` request to the client and waits
@@ -1001,6 +1022,29 @@ impl RequestContext {
     /// both report `false` on that lifecycle, so a handler serving both eras
     /// can branch on them rather than on the protocol version.
     ///
+    /// # Cancellation
+    ///
+    /// If this request is cancelled while waiting, for example because the
+    /// client sent `notifications/cancelled` for it, this returns an error
+    /// instead of waiting for the client's answer. Dropping the returned
+    /// future, for example when a `tokio::time::timeout` around it expires,
+    /// gives up the same way.
+    ///
+    /// When the transport has already taken up the `sampling/createMessage`
+    /// request and the connection is still live, the stdio, HTTP (2025-11-25
+    /// session), WebSocket, and in-process channel transports then send the
+    /// client `notifications/cancelled` for it. The transport decides when it
+    /// registers the request, just before writing it: a request whose waiter
+    /// is already gone by then is not sent. One whose waiter goes away while
+    /// the write is in progress (for example while the transport waits for
+    /// buffer space) is still sent, and then cancelled. Two transport
+    /// limitations apply:
+    /// [`ChannelTransport`](crate::client::ChannelTransport) does not deliver
+    /// a client's `notifications/cancelled` to the handler, and the
+    /// bidirectional `WebSocketTransport` dispatches requests inline, so
+    /// there this request must be issued from a spawned task to be written
+    /// before the handler returns.
+    ///
     pub async fn sample(&self, params: CreateMessageParams) -> Result<CreateMessageResult> {
         let requester = self.client_requester.as_ref().ok_or_else(|| {
             self.no_requester(
@@ -1010,7 +1054,8 @@ impl RequestContext {
             )
         })?;
 
-        requester.sample(params).await
+        self.await_client_request("Sampling", requester.sample(params))
+            .await
     }
 
     /// Check if elicitation is available
@@ -1068,6 +1113,14 @@ impl RequestContext {
     /// both report `false` on that lifecycle, so a handler serving both eras
     /// can branch on them rather than on the protocol version.
     ///
+    /// # Cancellation
+    ///
+    /// Behaves like [`sample`](Self::sample) (see its Cancellation section):
+    /// if this request is cancelled while waiting, or the returned future is
+    /// dropped, it gives up, and an `elicitation/create` request the
+    /// transport already registered for writing on a live connection is
+    /// cancelled with `notifications/cancelled`.
+    ///
     pub async fn elicit_form(&self, params: ElicitFormParams) -> Result<ElicitResult> {
         let requester = self.client_requester.as_ref().ok_or_else(|| {
             self.no_requester(
@@ -1076,7 +1129,11 @@ impl RequestContext {
             )
         })?;
 
-        requester.elicit(ElicitRequestParams::Form(params)).await
+        self.await_client_request(
+            "Elicitation",
+            requester.elicit(ElicitRequestParams::Form(params)),
+        )
+        .await
     }
 
     /// Request user input via URL redirect from the client
@@ -1131,6 +1188,14 @@ impl RequestContext {
     /// both report `false` on that lifecycle, so a handler serving both eras
     /// can branch on them rather than on the protocol version.
     ///
+    /// # Cancellation
+    ///
+    /// Behaves like [`sample`](Self::sample) (see its Cancellation section):
+    /// if this request is cancelled while waiting, or the returned future is
+    /// dropped, it gives up, and an `elicitation/create` request the
+    /// transport already registered for writing on a live connection is
+    /// cancelled with `notifications/cancelled`.
+    ///
     pub async fn elicit_url(&self, params: ElicitUrlParams) -> Result<ElicitResult> {
         let requester = self.client_requester.as_ref().ok_or_else(|| {
             self.no_requester(
@@ -1139,7 +1204,11 @@ impl RequestContext {
             )
         })?;
 
-        requester.elicit(ElicitRequestParams::Url(params)).await
+        self.await_client_request(
+            "Elicitation",
+            requester.elicit(ElicitRequestParams::Url(params)),
+        )
+        .await
     }
 
     /// Request simple confirmation from the user.
@@ -1567,6 +1636,92 @@ mod tests {
                 .to_string()
                 .contains("Sampling is not available: no client requester is configured")
         );
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_request_abandons_a_pending_elicitation() {
+        use crate::protocol::{ElicitFormParams, ElicitFormSchema, ElicitMode};
+
+        let (request_tx, mut request_rx) = outgoing_request_channel(10);
+        let requester: ClientRequesterHandle = Arc::new(ChannelClientRequester::new(request_tx));
+        let ctx = RequestContext::new(RequestId::Number(1)).with_client_requester(requester);
+
+        let waiting = ctx.clone();
+        let handler = tokio::spawn(async move {
+            waiting
+                .elicit_form(ElicitFormParams {
+                    mode: Some(ElicitMode::Form),
+                    message: "continue?".to_string(),
+                    requested_schema: ElicitFormSchema::new(),
+                    meta: None,
+                })
+                .await
+        });
+
+        let outgoing = request_rx.recv().await.expect("elicitation is sent");
+        assert!(!outgoing.response_tx.is_closed());
+        ctx.cancel();
+
+        let error = handler
+            .await
+            .unwrap()
+            .expect_err("cancelled elicitation fails");
+        assert!(
+            error.to_string().contains("Elicitation abandoned"),
+            "unexpected error: {error}"
+        );
+        // The waiter released its end, which is what transports watch for.
+        assert!(outgoing.response_tx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn an_already_cancelled_request_sends_no_sampling_request() {
+        use crate::protocol::{CreateMessageParams, SamplingMessage};
+
+        let (request_tx, mut request_rx) = outgoing_request_channel(10);
+        let requester: ClientRequesterHandle = Arc::new(ChannelClientRequester::new(request_tx));
+        let ctx = RequestContext::new(RequestId::Number(1)).with_client_requester(requester);
+        ctx.cancel();
+
+        let error = ctx
+            .sample(CreateMessageParams::new(
+                vec![SamplingMessage::user("hi")],
+                10,
+            ))
+            .await
+            .expect_err("cancelled request cannot sample");
+        assert!(error.to_string().contains("Sampling abandoned"));
+        assert!(request_rx.try_recv().is_err(), "nothing was sent");
+    }
+
+    #[tokio::test]
+    async fn an_answered_elicitation_is_returned_despite_later_cancellation() {
+        use crate::protocol::{ElicitAction, ElicitMode, ElicitUrlParams};
+
+        let (request_tx, mut request_rx) = outgoing_request_channel(10);
+        let requester: ClientRequesterHandle = Arc::new(ChannelClientRequester::new(request_tx));
+        let ctx = RequestContext::new(RequestId::Number(1)).with_client_requester(requester);
+
+        let answer = tokio::spawn(async move {
+            let outgoing = request_rx.recv().await.unwrap();
+            outgoing
+                .response_tx
+                .send(Ok(serde_json::json!({"action": "accept"})))
+                .unwrap();
+        });
+        let result = ctx
+            .elicit_url(ElicitUrlParams {
+                mode: Some(ElicitMode::Url),
+                elicitation_id: "e-1".to_string(),
+                message: "authorize".to_string(),
+                url: "https://example.com/auth".to_string(),
+                meta: None,
+            })
+            .await
+            .unwrap();
+        answer.await.unwrap();
+        ctx.cancel();
+        assert_eq!(result.action, ElicitAction::Accept);
     }
 
     #[test]

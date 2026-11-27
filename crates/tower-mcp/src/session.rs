@@ -36,6 +36,11 @@ impl From<u8> for SessionPhase {
     }
 }
 
+/// Marks a session that has carried 2026-07-28 traffic. Crate-private, so
+/// no caller can read or set it through the public extensions API.
+#[derive(Clone)]
+struct FinalTrafficSeen;
+
 /// Shared session state that can be cloned across requests.
 ///
 /// Uses atomic operations for thread-safe state transitions. Includes a type-safe
@@ -161,6 +166,21 @@ impl SessionState {
     /// an unsolicited `initialized` notification.
     pub fn handshake_started(&self) -> bool {
         self.handshake_started.load(Ordering::Acquire)
+    }
+
+    /// Record that a 2026-07-28 request was dispatched on this session.
+    ///
+    /// Kept as a crate-private marker in the extensions map rather than a
+    /// field, so `SessionState` (and every `RequestContext`) keeps its size.
+    pub(crate) fn mark_final_traffic(&self) {
+        if !self.final_traffic_seen() {
+            self.insert(FinalTrafficSeen);
+        }
+    }
+
+    /// Whether a 2026-07-28 request has been dispatched on this session.
+    pub(crate) fn final_traffic_seen(&self) -> bool {
+        self.get::<FinalTrafficSeen>().is_some()
     }
 
     /// Transition from Uninitialized to Initializing.

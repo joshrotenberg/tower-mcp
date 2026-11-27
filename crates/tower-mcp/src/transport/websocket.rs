@@ -94,6 +94,9 @@ use crate::protocol::{
     RequestId,
 };
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
+use crate::transport::pending::{
+    AbandonSender, PendingClientRequests, abandon_channel, cancelled_notification_json,
+};
 use crate::transport::service::{
     CatchError, InjectAnnotations, McpBoxService, ServiceFactory, identity_factory,
 };
@@ -199,11 +202,6 @@ impl SessionStore {
     }
 }
 
-/// Pending request waiting for a response
-struct PendingRequest {
-    response_tx: tokio::sync::oneshot::Sender<Result<serde_json::Value>>,
-}
-
 /// Shared state for WebSocket transport
 struct AppState {
     router_template: McpRouter,
@@ -243,6 +241,14 @@ struct AppState {
 /// handler. `notifications/cancelled` is processed between requests, so it
 /// cannot interrupt a handler that is already executing. Final
 /// `subscriptions/listen` multiplexing is not implemented on this binding.
+///
+/// With [`with_sampling`](Self::with_sampling), requests are still
+/// dispatched one at a time on the connection's loop, and that same loop
+/// writes server-to-client requests and reads their responses. A handler
+/// that awaits `ctx.sample()` or `ctx.elicit_form()` directly therefore
+/// cannot have its request written until it returns. Issue such requests
+/// from a task the handler spawns. If that task drops the request after it
+/// was written, the client receives `notifications/cancelled` for it.
 pub struct WebSocketTransport {
     router: McpRouter,
     /// Types copied from each upgrade request's extensions into the
@@ -964,9 +970,13 @@ async fn handle_socket_bidirectional(
         .with_extensions(_mcp_extensions)
         .protocol_support(protocol_support);
 
-    // Track pending outgoing requests
-    let pending_requests: Arc<Mutex<HashMap<RequestId, PendingRequest>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    // Track pending outgoing requests, and the ids of those whose waiter
+    // gave up so the client can be told (#1705).
+    let pending_requests = PendingClientRequests::new();
+    let (abandon_tx, mut abandon_rx) = abandon_channel();
+    // However the connection ends, release every handler waiting on the
+    // client.
+    let _release_pending = pending_requests.clear_on_drop();
 
     let (sender, mut receiver) = socket.split();
     let sender = Arc::new(Mutex::new(sender));
@@ -996,7 +1006,7 @@ async fn handle_socket_bidirectional(
                             text,
                             &mut service,
                             &router,
-                            pending_requests.clone(),
+                            &pending_requests,
                             sender.clone(),
                         ).await;
                         if let Err(e) = result {
@@ -1033,11 +1043,28 @@ async fn handle_socket_bidirectional(
             Some(outgoing) = request_rx.recv() => {
                 let result = send_outgoing_request(
                     outgoing,
-                    pending_requests.clone(),
+                    &pending_requests,
+                    abandon_tx.clone(),
                     sender.clone(),
                 ).await;
+                // The socket cannot be written; stop rather than keep
+                // writing (or cancelling) on a broken connection.
                 if let Err(e) = result {
                     tracing::error!(error = %e, "Error sending outgoing request");
+                    break;
+                }
+            }
+
+            // Cancel server-to-client requests whose waiter gave up. Drained
+            // on this loop, which also writes the requests, so a
+            // cancellation never overtakes its request.
+            Some(id) = abandon_rx.recv() => {
+                if let Some(json) = cancelled_notification_json(&id) {
+                    let mut s = sender.lock().await;
+                    if let Err(e) = s.send(Message::Text(json.into())).await {
+                        tracing::error!(error = %e, "Failed to send notifications/cancelled");
+                        break;
+                    }
                 }
             }
 
@@ -1097,7 +1124,7 @@ async fn handle_incoming_message<S>(
     text: &str,
     service: &mut JsonRpcService<McpBoxService>,
     router: &McpRouter,
-    pending_requests: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
+    pending_requests: &PendingClientRequests,
     sender: Arc<Mutex<S>>,
 ) -> Result<()>
 where
@@ -1132,7 +1159,8 @@ where
             return Ok(());
         }
         crate::framing::FrameClass::Response => {
-            return handle_response(&parsed, pending_requests).await;
+            handle_response(&parsed, pending_requests);
+            return Ok(());
         }
         crate::framing::FrameClass::Request => {}
     }
@@ -1184,64 +1212,50 @@ where
 }
 
 /// Handle a response to one of our pending requests
-async fn handle_response(
-    parsed: &serde_json::Value,
-    pending_requests: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
-) -> Result<()> {
+fn handle_response(parsed: &serde_json::Value, pending_requests: &PendingClientRequests) {
     let id = match parsed.get("id") {
         Some(id) => {
             let Some(id) = RequestId::from_json(id) else {
                 tracing::warn!("Response has invalid id type");
-                return Ok(());
+                return;
             };
             id
         }
         None => {
             tracing::warn!("Response missing id field");
-            return Ok(());
+            return;
         }
     };
 
-    let pending = {
-        let mut pending_requests = pending_requests.lock().await;
-        pending_requests.remove(&id)
+    let result = if let Some(error) = parsed.get("error") {
+        let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+        let message = error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("Unknown error");
+        Err(Error::Internal(format!(
+            "Client error ({}): {}",
+            code, message
+        )))
+    } else if let Some(result) = parsed.get("result") {
+        Ok(result.clone())
+    } else {
+        Err(Error::Internal(
+            "Response has neither result nor error".to_string(),
+        ))
     };
 
-    match pending {
-        Some(pending) => {
-            let result = if let Some(error) = parsed.get("error") {
-                let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-                let message = error
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("Unknown error");
-                Err(Error::Internal(format!(
-                    "Client error ({}): {}",
-                    code, message
-                )))
-            } else if let Some(result) = parsed.get("result") {
-                Ok(result.clone())
-            } else {
-                Err(Error::Internal(
-                    "Response has neither result nor error".to_string(),
-                ))
-            };
-
-            // Send result to waiter (ignore if they've dropped the receiver)
-            let _ = pending.response_tx.send(result);
-        }
-        None => {
-            tracing::warn!(id = ?id, "Received response for unknown request");
-        }
-    }
-
-    Ok(())
+    pending_requests.complete(&id, result).log_undelivered(&id);
 }
 
-/// Send an outgoing request to the client
+/// Send an outgoing request to the client.
+///
+/// Returns an error only when the socket cannot be written, in which case the
+/// request has been failed and the caller must stop using the connection.
 async fn send_outgoing_request<S>(
     outgoing: OutgoingRequest,
-    pending_requests: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
+    pending_requests: &PendingClientRequests,
+    abandon_tx: AbandonSender,
     sender: Arc<Mutex<S>>,
 ) -> Result<()>
 where
@@ -1256,28 +1270,32 @@ where
         params: Some(outgoing.params),
     };
 
-    let request_json = serde_json::to_string(&request)
-        .map_err(|e| Error::Transport(format!("Failed to serialize request: {}", e)))?;
+    let request_json = match serde_json::to_string(&request) {
+        Ok(json) => json,
+        Err(e) => {
+            let _ = outgoing.response_tx.send(Err(Error::Transport(format!(
+                "Failed to serialize request: {e}"
+            ))));
+            return Ok(());
+        }
+    };
 
     tracing::debug!(output = %request_json, "Sending request to client");
 
-    // Store pending request
-    {
-        let mut pending = pending_requests.lock().await;
-        pending.insert(
-            outgoing.id,
-            PendingRequest {
-                response_tx: outgoing.response_tx,
-            },
-        );
+    // Store pending request. A waiter that already gave up needs no
+    // request and no cancellation.
+    let id = outgoing.id;
+    if !pending_requests.register(id.clone(), outgoing.response_tx, abandon_tx) {
+        return Ok(());
     }
 
     // Send the request
     let mut sender = sender.lock().await;
-    sender
-        .send(Message::Text(request_json.into()))
-        .await
-        .map_err(|e| Error::Transport(format!("Failed to send request: {}", e)))?;
+    if let Err(e) = sender.send(Message::Text(request_json.into())).await {
+        let message = format!("Failed to send request: {e}");
+        pending_requests.fail(std::slice::from_ref(&id), &message);
+        return Err(Error::Transport(message));
+    }
 
     Ok(())
 }
@@ -1345,6 +1363,117 @@ mod tests {
 
     fn create_test_router() -> McpRouter {
         McpRouter::new().server_info("test-server", "1.0.0")
+    }
+
+    /// A sink whose every write fails, like a socket that has gone away.
+    struct BrokenSink;
+
+    impl futures::Sink<Message> for BrokenSink {
+        type Error = String;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), String>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            _item: Message,
+        ) -> std::result::Result<(), String> {
+            Err("connection reset".to_string())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), String>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), String>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A request that cannot be written is failed for its waiter and left
+    /// unregistered, so it can never be cancelled later; the caller is told
+    /// to stop writing.
+    #[tokio::test]
+    async fn failed_request_write_fails_the_waiter_and_stops_the_writer() {
+        let pending = PendingClientRequests::new();
+        let (abandon_tx, mut abandon_rx) = abandon_channel();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let outgoing = OutgoingRequest {
+            id: RequestId::Number(1),
+            method: "sampling/createMessage".to_string(),
+            params: serde_json::json!({}),
+            response_tx,
+        };
+
+        let result = send_outgoing_request(
+            outgoing,
+            &pending,
+            abandon_tx,
+            Arc::new(Mutex::new(BrokenSink)),
+        )
+        .await;
+
+        assert!(matches!(result, Err(Error::Transport(_))), "{result:?}");
+        let delivered = response_rx.await.expect("the waiter is answered");
+        assert!(
+            matches!(&delivered, Err(Error::Transport(m)) if m.contains("connection reset")),
+            "{delivered:?}"
+        );
+        // The watcher ended without reporting an abandonment.
+        let next = tokio::time::timeout(std::time::Duration::from_secs(2), abandon_rx.recv())
+            .await
+            .expect("the abandon channel closes");
+        assert_eq!(next, None);
+        assert_eq!(
+            pending.complete(&RequestId::Number(1), Ok(serde_json::json!({}))),
+            crate::transport::pending::Completion::Unknown
+        );
+    }
+
+    /// The client's reply to a server-to-client request, arriving on the
+    /// bidirectional receive path, completes the registry entry: the waiter
+    /// gets the result and nothing is reported as abandoned.
+    #[tokio::test]
+    async fn client_reply_on_the_receive_path_completes_the_request() {
+        let router = create_test_router();
+        let mut service = JsonRpcService::new((identity_factory())(router.clone()));
+        let pending = PendingClientRequests::new();
+        let (abandon_tx, mut abandon_rx) = abandon_channel();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        assert!(pending.register(RequestId::Number(1), response_tx, abandon_tx));
+
+        // Byte for byte what the wire test sends.
+        let reply = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {"role": "assistant", "content": {"type": "text", "text": "hi"}, "model": "m"}
+        })
+        .to_string();
+        handle_incoming_message(
+            &reply,
+            &mut service,
+            &router,
+            &pending,
+            Arc::new(Mutex::new(BrokenSink)),
+        )
+        .await
+        .expect("a reply needs no write");
+
+        let delivered = response_rx.await.unwrap().expect("delivered as a result");
+        assert_eq!(delivered["model"], "m");
+        let next = tokio::time::timeout(std::time::Duration::from_secs(2), abandon_rx.recv())
+            .await
+            .expect("the abandon channel closes");
+        assert_eq!(next, None);
     }
 
     #[tokio::test]
