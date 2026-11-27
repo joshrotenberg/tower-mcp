@@ -4946,11 +4946,9 @@ async fn cross_origin_redirect_is_followed_when_opted_in() {
 
 /// The same block applies on the established-session (background task) send
 /// path, not just the pre-session synchronous path: a redirected `tools/list`
-/// fails instead of hanging. Like any other `reqwest::Error` on that path
-/// (network error, timeout, ...), the blocked redirect also marks the
-/// transport disconnected -- that part is unrelated to this fix, just the
-/// existing behavior for a background POST that fails at the `send()` level
-/// rather than with an HTTP-level error.
+/// fails instead of hanging. The server answered, so the blocked redirect
+/// fails only that request: the transport stays connected and the next request
+/// succeeds (#1713).
 #[tokio::test]
 async fn established_session_cross_origin_redirect_fails_without_hanging() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5008,6 +5006,11 @@ async fn established_session_cross_origin_redirect_fails_without_hanging() {
         0,
         "the redirect target must never receive the request"
     );
+
+    tokio::time::timeout(Duration::from_secs(3), client.ping())
+        .await
+        .expect("ping after the blocked redirect hung")
+        .expect("a rejected redirect must not close the transport");
 }
 
 // ---------------------------------------------------------------------------

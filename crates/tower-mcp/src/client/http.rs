@@ -974,15 +974,24 @@ fn is_jsonrpc_error_response(value: &serde_json::Value) -> bool {
         && value.pointer("/error/message").is_some()
 }
 
+/// A request that could not be sent, or whose response never arrived.
+///
+/// It carries only the redacted message for the request's error frame. It
+/// deliberately has no "connection failed" flag: no send failure marks the
+/// transport disconnected (#1713); the background request task in
+/// `HttpClientTransport::send` explains why.
 struct HttpRequestSendError {
     message: String,
-    connection_failed: bool,
 }
 
 // Neither Display, Debug, nor a source chain is safe: reqwest carries the URL,
 // and a custom redirect error can quote an entirely different URL.
 fn request_error_message(error: &reqwest::Error) -> String {
-    let category = if error.is_timeout() {
+    let category = if error.is_connect() && error.is_timeout() {
+        // A connect timeout (set on a client passed to `with_client`) is a
+        // connect failure first, like a refused connect below.
+        "connection timed out"
+    } else if error.is_timeout() {
         "timeout"
     } else if error.is_redirect() {
         "redirect rejected (check redirect policy)"
@@ -1007,7 +1016,6 @@ impl HttpRequestSendError {
     fn request(error: reqwest::Error) -> Self {
         Self {
             message: request_error_message(&error),
-            connection_failed: true,
         }
     }
 
@@ -1015,7 +1023,6 @@ impl HttpRequestSendError {
     fn oauth(_error: OAuthClientError) -> Self {
         Self {
             message: "OAuth token acquisition failed".to_string(),
-            connection_failed: false,
         }
     }
 }
@@ -1556,13 +1563,31 @@ impl ClientTransport for HttpClientTransport {
                 let response = match response_result {
                     Ok(r) => r,
                     Err(e) => {
-                        let connection_failed = e.connection_failed;
+                        // This request failed, and only this request: its
+                        // caller gets the error frame, and the transport stays
+                        // connected whatever the cause (a refused or timed-out
+                        // connect, a pooled keep-alive connection the server
+                        // had just closed, a timeout, a rejected redirect).
+                        //
+                        // Each POST is independent and opens or reuses its own
+                        // connection, so the next one may well succeed. On
+                        // 2026-07-28 requests are sessionless. On 2025-11-25
+                        // the session lives in `Mcp-Session-Id`, not in any TCP
+                        // connection; if the server has dropped it, the next
+                        // request gets a 404 and session recovery takes over.
+                        // A disconnect, by contrast, is permanent (nothing sets
+                        // `connected` back), so latching it here would let one
+                        // transient failure outlive its cause (#1713).
+                        //
+                        // The caller still sees what kind of failure it was:
+                        // a connect failure reads "connection failed" or
+                        // "connection timed out", which a consumer can treat
+                        // as a cue to reconnect. Liveness stays with the paths
+                        // that own it: `close()`, the SSE listener, and
+                        // `status_ends_transport`.
                         tracing::error!(error = %e.message, "Background HTTP request failed");
                         if let Some(id) = &reply_id {
                             let _ = tx.send(transport_error_frame(id, &e.message)).await;
-                        }
-                        if connection_failed {
-                            connected.store(false, Ordering::Release);
                         }
                         return;
                     }
@@ -1745,6 +1770,9 @@ impl ClientTransport for HttpClientTransport {
                             }
                         }
                         Err(BoundedBodyError::Io(e)) => {
+                            // As with a failed send above: the body of this
+                            // one response broke off, so this request fails
+                            // alone and the transport stays connected (#1713).
                             let message = request_error_message(&e);
                             tracing::error!(error = %message, "Failed to read response body");
                             if let Some(id) = &reply_id {
@@ -1755,7 +1783,6 @@ impl ClientTransport for HttpClientTransport {
                                     ))
                                     .await;
                             }
-                            connected.store(false, Ordering::Release);
                         }
                     }
                 }
@@ -4520,6 +4547,421 @@ mod tests {
             &url("https://example.com/mcp"),
             true,
         ));
+    }
+
+    // =========================================================================
+    // #1713: a failed background POST fails only its own request
+    // =========================================================================
+
+    mod request_failure_scope {
+        use super::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpSocket, TcpStream};
+
+        const WAIT: Duration = Duration::from_secs(5);
+        const MODERN_META: &str =
+            r#""_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}"#;
+
+        /// How the server answers the one request it is told to fail.
+        #[derive(Clone, Debug)]
+        enum Failure {
+            /// Read the request, then close the socket without a response
+            /// byte: the keep-alive race, seen from the client.
+            DropWithoutResponse,
+            /// Send a 200 head promising more body than follows, then close.
+            BodyCutShort,
+            /// Read the request and hold the connection this long before
+            /// closing it without a response: a slow reply.
+            Hold(Duration),
+            /// Answer with a `307` to this location.
+            Redirect(String),
+        }
+
+        /// A running fixture: its URL, every request head it read, and every
+        /// error it hit writing a response. A test asserts `errors` is empty
+        /// so a fixture that failed to write is not mistaken for the failure
+        /// under test.
+        struct Fixture {
+            url: String,
+            heads: Arc<std::sync::Mutex<Vec<String>>>,
+            errors: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        impl Fixture {
+            fn assert_wrote_everything(&self) {
+                let errors = self.errors.lock().unwrap();
+                assert!(errors.is_empty(), "fixture write errors: {errors:?}");
+            }
+        }
+
+        /// Read one HTTP/1.1 request; return its head and body.
+        async fn read_request(stream: &mut TcpStream) -> Option<(String, String)> {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                    let len = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    while buf.len() < end + 4 + len {
+                        let n = stream.read(&mut chunk).await.ok()?;
+                        if n == 0 {
+                            return None;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let body = String::from_utf8_lossy(&buf[end + 4..end + 4 + len]).into_owned();
+                    return Some((head, body));
+                }
+                let n = stream.read(&mut chunk).await.ok()?;
+                if n == 0 {
+                    return None;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+        }
+
+        async fn write_raw(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
+            stream.write_all(bytes).await?;
+            stream.flush().await
+        }
+
+        fn json_response(extra: &str, body: &str) -> String {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        }
+
+        /// A raw server that fails the request with id `fail_id` as `failure`
+        /// describes, answers `initialize` with a 2025-11-25 session, and
+        /// answers anything else with an empty result echoing the request's
+        /// id. One connection per request.
+        async fn serve(fail_id: i64, failure: Failure) -> Fixture {
+            serve_on(
+                TcpListener::bind("127.0.0.1:0").await.unwrap(),
+                fail_id,
+                failure,
+            )
+        }
+
+        /// [`serve`] on a listener the test already holds.
+        fn serve_on(listener: TcpListener, fail_id: i64, failure: Failure) -> Fixture {
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let errors = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (seen, errs) = (heads.clone(), errors.clone());
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let (seen, errs, failure) = (seen.clone(), errs.clone(), failure.clone());
+                    tokio::spawn(async move {
+                        let Some((head, body)) = read_request(&mut stream).await else {
+                            return;
+                        };
+                        seen.lock().unwrap().push(head);
+                        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+                        let id = value["id"].clone();
+                        let written = if id == fail_id {
+                            match failure {
+                                Failure::DropWithoutResponse => Ok(()),
+                                Failure::BodyCutShort => {
+                                    write_raw(
+                                        &mut stream,
+                                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 500\r\n\r\n{\"jsonrpc\"",
+                                    )
+                                    .await
+                                }
+                                Failure::Hold(duration) => {
+                                    tokio::time::sleep(duration).await;
+                                    Ok(())
+                                }
+                                Failure::Redirect(location) => {
+                                    let response = format!(
+                                        "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                    );
+                                    write_raw(&mut stream, response.as_bytes()).await
+                                }
+                            }
+                        } else if value["method"] == "initialize" {
+                            let reply = format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":"2025-11-25","capabilities":{{}},"serverInfo":{{"name":"raw","version":"0"}}}}}}"#
+                            );
+                            let response = json_response(
+                                "mcp-session-id: s-1\r\nmcp-protocol-version: 2025-11-25\r\n",
+                                &reply,
+                            );
+                            write_raw(&mut stream, response.as_bytes()).await
+                        } else {
+                            let reply = format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{}}}}"#);
+                            write_raw(&mut stream, json_response("", &reply).as_bytes()).await
+                        };
+                        if let Err(error) = written {
+                            errs.lock().unwrap().push(format!("id {id}: {error}"));
+                        }
+                    });
+                }
+            });
+            Fixture { url, heads, errors }
+        }
+
+        /// A loopback address nothing listens on yet, held for as long as
+        /// the returned socket lives: it is bound, so no other process can
+        /// take the port, but not listening until the test calls `listen`.
+        /// How a connect to it fails depends on the platform: Linux refuses
+        /// it, while macOS drops the SYN and the connect times out. Both are
+        /// connect errors; see [`assert_connect_failure`].
+        fn unreachable_address() -> (TcpSocket, std::net::SocketAddr) {
+            let socket = TcpSocket::new_v4().unwrap();
+            socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let address = socket.local_addr().unwrap();
+            (socket, address)
+        }
+
+        fn config() -> HttpClientConfig {
+            HttpClientConfig {
+                auto_sse: false,
+                request_timeout: WAIT,
+                ..Default::default()
+            }
+        }
+
+        /// A transport on a caller-supplied client with a short connect
+        /// timeout, so a platform that drops the SYN to
+        /// [`unreachable_address`] fails the connect quickly instead of at
+        /// the request timeout. Its redirect policy is reqwest's default,
+        /// which follows a `307` to any origin.
+        fn connect_limited_transport(url: &str) -> HttpClientTransport {
+            let client = reqwest::Client::builder()
+                .connect_timeout(Duration::from_millis(500))
+                .build()
+                .unwrap();
+            HttpClientTransport::with_client(url, client)
+        }
+
+        /// The messages `request_error_message` gives a reqwest error with
+        /// `is_connect()`: refused, or timed out while connecting.
+        const CONNECT_FAILURES: [&str; 2] = [
+            "HTTP request failed: connection failed",
+            "HTTP request failed: connection timed out",
+        ];
+
+        /// The request failed while connecting. Which connect failure is
+        /// platform-dependent; that it is one is what decides `connected`.
+        fn assert_connect_failure(message: &str) {
+            assert!(
+                CONNECT_FAILURES.contains(&message),
+                "expected a connect failure, got: {message}"
+            );
+        }
+
+        /// The request failed in the send itself, before any response head,
+        /// on a connection that was made: the send-error branch, not a
+        /// connect failure. The category after the prefix is left to the
+        /// platform.
+        fn assert_established_send_failure(message: &str) {
+            assert!(
+                message.starts_with("HTTP request failed: ")
+                    && !CONNECT_FAILURES.contains(&message),
+                "expected a send failure on an established connection, got: {message}"
+            );
+        }
+
+        /// The response head arrived and reading the body failed: only the
+        /// background path's body-read branch produces this prefix. The
+        /// category after it (an I/O or a decode error) is left to the
+        /// platform.
+        fn assert_body_read_failure(message: &str) {
+            assert!(
+                message.starts_with("failed to read response body: HTTP request failed: "),
+                "expected the body-read branch, got: {message}"
+            );
+        }
+
+        fn transport(url: &str) -> HttpClientTransport {
+            HttpClientTransport::with_config(url, config())
+        }
+
+        async fn next_frame(transport: &mut HttpClientTransport) -> serde_json::Value {
+            let frame = tokio::time::timeout(WAIT, transport.recv())
+                .await
+                .expect("no frame arrived")
+                .expect("recv failed")
+                .expect("transport closed");
+            serde_json::from_str(&frame).unwrap()
+        }
+
+        /// Wait for the background task of request `id` to finish, so any
+        /// change it makes to `connected` has happened. Its error frame is
+        /// sent before that change, so the frame alone does not prove it.
+        async fn settle(transport: &mut HttpClientTransport, id: i64) {
+            let task = transport
+                .request_tasks
+                .remove(&RequestId::Number(id))
+                .expect("the request ran on a background task");
+            tokio::time::timeout(WAIT, task)
+                .await
+                .expect("the background task did not finish")
+                .unwrap();
+        }
+
+        fn modern_ping(id: i64) -> String {
+            format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping","params":{{{MODERN_META}}}}}"#)
+        }
+
+        /// Send request `id`, return its error message once its task has
+        /// settled, and check the message carries no URL.
+        async fn failed_request(transport: &mut HttpClientTransport, id: i64, url: &str) -> String {
+            transport.send(&modern_ping(id)).await.unwrap();
+            let frame = next_frame(transport).await;
+            assert_eq!(frame["id"], id, "{frame}");
+            assert_eq!(frame["error"]["code"], -32000, "{frame}");
+            let message = frame["error"]["message"].as_str().unwrap().to_string();
+            assert!(!message.contains(url), "messages stay redacted: {message}");
+            settle(transport, id).await;
+            message
+        }
+
+        async fn assert_next_ping_succeeds(transport: &mut HttpClientTransport, id: i64) {
+            transport.send(&modern_ping(id)).await.unwrap();
+            let frame = next_frame(transport).await;
+            assert_eq!(frame["id"], id, "{frame}");
+            assert!(frame.get("result").is_some(), "got {frame}");
+        }
+
+        /// On a 2026-07-28 connection, one POST failing at the HTTP layer
+        /// gets its error frame, leaves the transport connected, and the next
+        /// request on the same transport succeeds. Each failure is pinned to
+        /// its own branch by its message: the send-error branch for a
+        /// dropped connection (the keep-alive race), the body-read branch for
+        /// a cut-short body.
+        #[tokio::test]
+        async fn modern_request_failure_fails_only_that_request() {
+            for failure in [Failure::DropWithoutResponse, Failure::BodyCutShort] {
+                let fixture = serve(1, failure.clone()).await;
+                let mut transport = transport(&fixture.url);
+
+                let message = failed_request(&mut transport, 1, &fixture.url).await;
+                match failure {
+                    Failure::BodyCutShort => assert_body_read_failure(&message),
+                    _ => assert_established_send_failure(&message),
+                }
+                assert!(
+                    transport.is_connected(),
+                    "{failure:?}: one failed POST must not close the transport"
+                );
+                assert_next_ping_succeeds(&mut transport, 2).await;
+                fixture.assert_wrote_everything();
+            }
+        }
+
+        /// The session-bound (2025-11-25) lifecycle follows the same rule:
+        /// the session lives in `Mcp-Session-Id`, not in the TCP connection
+        /// the failed POST used, so the next request reuses the session and
+        /// succeeds.
+        #[tokio::test]
+        async fn session_request_failure_fails_only_that_request() {
+            let fixture = serve(2, Failure::DropWithoutResponse).await;
+            let mut transport = transport(&fixture.url);
+
+            transport
+                .send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+                .await
+                .unwrap();
+            assert_eq!(next_frame(&mut transport).await["id"], 1);
+            assert_eq!(transport.session_id.as_deref(), Some("s-1"));
+
+            transport
+                .send(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)
+                .await
+                .unwrap();
+            let frame = next_frame(&mut transport).await;
+            assert_eq!(frame["id"], 2);
+            assert_established_send_failure(frame["error"]["message"].as_str().unwrap());
+            settle(&mut transport, 2).await;
+            assert!(transport.is_connected());
+            assert_eq!(transport.session_id.as_deref(), Some("s-1"));
+
+            transport
+                .send(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}"#)
+                .await
+                .unwrap();
+            let frame = next_frame(&mut transport).await;
+            assert_eq!(frame["id"], 3);
+            assert!(frame.get("result").is_some(), "got {frame}");
+            let heads = fixture.heads.lock().unwrap();
+            assert!(
+                heads.last().unwrap().contains("mcp-session-id: s-1"),
+                "the next request stays on the same session"
+            );
+            fixture.assert_wrote_everything();
+        }
+
+        /// A connect failure (nothing listening) fails that request with a
+        /// connect message, which a consumer can act on, and leaves the
+        /// transport connected: once the server is listening on the same
+        /// address, the next request on the same transport succeeds.
+        #[tokio::test]
+        async fn connect_failure_fails_only_that_request() {
+            let (held, address) = unreachable_address();
+            let url = format!("http://{address}");
+            let mut transport = connect_limited_transport(&url);
+
+            let message = failed_request(&mut transport, 1, &url).await;
+            assert_connect_failure(&message);
+            assert!(
+                transport.is_connected(),
+                "a failed connect must not latch the transport disconnected"
+            );
+
+            let fixture = serve_on(held.listen(16).unwrap(), -1, Failure::DropWithoutResponse);
+            assert_next_ping_succeeds(&mut transport, 2).await;
+            fixture.assert_wrote_everything();
+        }
+
+        /// A connection that is made but whose reply is slower than the
+        /// request timeout fails only that request.
+        #[tokio::test]
+        async fn slow_response_fails_only_that_request() {
+            let fixture = serve(1, Failure::Hold(Duration::from_secs(3))).await;
+            let mut transport = HttpClientTransport::with_config(
+                &fixture.url,
+                HttpClientConfig {
+                    request_timeout: Duration::from_secs(1),
+                    ..config()
+                },
+            );
+
+            let message = failed_request(&mut transport, 1, &fixture.url).await;
+            assert_eq!(message, "HTTP request failed: timeout");
+            assert!(transport.is_connected());
+            assert_next_ping_succeeds(&mut transport, 2).await;
+            fixture.assert_wrote_everything();
+        }
+
+        /// A followed redirect to another origin that cannot be connected to
+        /// fails that request, and the transport stays connected: the next
+        /// request reaches the endpoint. The transport is on a
+        /// caller-supplied client, whose redirect policy the transport cannot
+        /// observe; the outcome must not depend on knowing where it failed.
+        #[tokio::test]
+        async fn connect_failure_at_a_redirect_target_fails_only_that_request() {
+            let (_held, target) = unreachable_address();
+            let fixture = serve(1, Failure::Redirect(format!("http://{target}/mcp"))).await;
+            let mut transport = connect_limited_transport(&fixture.url);
+
+            let message = failed_request(&mut transport, 1, &fixture.url).await;
+            assert_connect_failure(&message);
+            assert!(
+                transport.is_connected(),
+                "a refused redirect target must not close the endpoint's transport"
+            );
+            assert_next_ping_succeeds(&mut transport, 2).await;
+            assert_eq!(fixture.heads.lock().unwrap().len(), 2);
+            fixture.assert_wrote_everything();
+        }
     }
 
     // =========================================================================
