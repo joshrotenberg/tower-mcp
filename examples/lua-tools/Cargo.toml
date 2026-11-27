@@ -13,7 +13,7 @@ tower-mcp = { workspace = true, features = ["dynamic-tools", "schema-validation"
 # the "handlers backed by a !Send runtime" guide), so `Lua` need not be
 # `Send`. No other Lua version feature is enabled either: mlua-sys accepts
 # exactly one, and `--all-features` must keep building.
-mlua = { version = "=0.12.2", default-features = false, features = ["lua54", "vendored", "async", "serde"] }
+mlua = { version = "=0.12.3", default-features = false, features = ["lua54", "vendored", "async", "serde"] }
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
