@@ -3197,6 +3197,86 @@ async fn test_bidirectional_sampling_round_trip() {
     );
 }
 
+#[tokio::test]
+async fn handler_observes_wire_ids_for_concurrent_server_requests() {
+    use crate::protocol::{ElicitRequestParams, ElicitResult};
+
+    #[derive(Clone)]
+    struct RecordingHandler {
+        both_started: Arc<tokio::sync::Barrier>,
+        seen: mpsc::Sender<(String, Option<RequestId>, Option<RequestId>)>,
+    }
+
+    #[async_trait]
+    impl ClientHandler for RecordingHandler {
+        async fn handle_elicit(
+            &self,
+            params: ElicitRequestParams,
+        ) -> std::result::Result<ElicitResult, JsonRpcError> {
+            let ElicitRequestParams::Form(params) = params else {
+                panic!("expected form elicitation");
+            };
+            self.both_started.wait().await;
+            let id = self.current_request_id();
+            let handler = self.clone();
+            let spawned_id = tokio::spawn(async move { handler.current_request_id() })
+                .await
+                .unwrap();
+            self.seen
+                .send((params.message, id, spawned_id))
+                .await
+                .unwrap();
+            Ok(ElicitResult::decline())
+        }
+    }
+
+    let transport = MockTransport::with_responses(vec![mock_initialize_response()]);
+    let inject = transport.incoming_tx.clone();
+    let (seen, mut observed) = mpsc::channel(2);
+    let handler = RecordingHandler {
+        both_started: Arc::new(tokio::sync::Barrier::new(2)),
+        seen,
+    };
+
+    let client = McpClient::builder()
+        .with_elicitation()
+        .connect(transport, handler)
+        .await
+        .unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    let mut sent_ids = HashMap::new();
+    for (message, id) in [
+        ("first", serde_json::json!(100)),
+        ("second", serde_json::json!("100")),
+    ] {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "elicitation/create",
+            "params": {
+                "message": message,
+                "requestedSchema": {"type": "object", "properties": {}, "required": []}
+            }
+        });
+        sent_ids.insert(message, request["id"].clone());
+        inject.send(request.to_string()).await.unwrap();
+    }
+
+    for _ in 0..sent_ids.len() {
+        let (message, id, spawned_id) =
+            tokio::time::timeout(Duration::from_secs(5), observed.recv())
+                .await
+                .expect("both handlers should run concurrently")
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(id).unwrap(),
+            sent_ids.remove(message.as_str()).unwrap()
+        );
+        assert_eq!(spawned_id, None, "a spawned task should have no request ID");
+    }
+}
+
 // =========================================================================
 // Server-initiated request cancellation (#1483)
 // =========================================================================
@@ -4017,7 +4097,13 @@ async fn test_response_with_both_result_and_error_fails_as_malformed() {
 
 #[derive(Default)]
 struct RecordingElicitHandler {
-    seen: Arc<Mutex<Vec<crate::protocol::ElicitRequestParams>>>,
+    seen: Arc<Mutex<Vec<RecordedElicitation>>>,
+}
+
+#[derive(Debug)]
+struct RecordedElicitation {
+    params: crate::protocol::ElicitRequestParams,
+    request_id: Option<RequestId>,
 }
 
 #[async_trait]
@@ -4026,7 +4112,10 @@ impl ClientHandler for RecordingElicitHandler {
         &self,
         params: crate::protocol::ElicitRequestParams,
     ) -> std::result::Result<crate::protocol::ElicitResult, JsonRpcError> {
-        self.seen.lock().unwrap().push(params);
+        self.seen.lock().unwrap().push(RecordedElicitation {
+            params,
+            request_id: self.current_request_id(),
+        });
         Ok(crate::protocol::ElicitResult {
             action: crate::protocol::ElicitAction::Accept,
             content: None,
@@ -4081,10 +4170,17 @@ async fn final_client_fulfils_an_id_less_url_elicitation_frame() {
 
     {
         let seen = seen.lock().unwrap();
-        let [ElicitRequestParams::FinalUrl(params)] = seen.as_slice() else {
+        let [
+            RecordedElicitation {
+                params: ElicitRequestParams::FinalUrl(params),
+                request_id,
+            },
+        ] = seen.as_slice()
+        else {
             panic!("expected one final URL elicitation, got {seen:?}");
         };
         assert_eq!(params.url, "https://example.com/oauth/start");
+        assert_eq!(*request_id, None, "automatic input has no wire request ID");
     }
 
     let retry: serde_json::Value =
@@ -4159,7 +4255,10 @@ async fn legacy_elicitation_request_still_requires_the_id() {
     assert_eq!(reply_to(101).await["result"]["action"], "accept");
     assert!(matches!(
         seen.lock().unwrap().as_slice(),
-        [ElicitRequestParams::Url(_)]
+        [RecordedElicitation {
+            params: ElicitRequestParams::Url(_),
+            request_id: Some(RequestId::Number(101)),
+        }]
     ));
 }
 
@@ -4224,10 +4323,16 @@ fn sep1330_form_params() -> serde_json::Value {
 
 /// Assert the handler saw exactly one form elicitation, decoded into the
 /// modelled variant for each shape, and that it re-encodes to what was sent.
-fn assert_sep1330_form_intact(seen: &[crate::protocol::ElicitRequestParams]) {
+fn assert_sep1330_form_intact(seen: &[RecordedElicitation]) {
     use crate::protocol::{ElicitRequestParams, PrimitiveSchemaDefinition};
 
-    let [ElicitRequestParams::Form(params)] = seen else {
+    let [
+        RecordedElicitation {
+            params: ElicitRequestParams::Form(params),
+            ..
+        },
+    ] = seen
+    else {
         panic!("expected one form elicitation, got {seen:?}");
     };
     let properties = &params.requested_schema.properties;

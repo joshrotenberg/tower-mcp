@@ -4009,14 +4009,12 @@ async fn handle_incoming<T: ClientTransport, H: ClientHandler>(
         // otherwise deadlock the message loop that is supposed to answer
         // it (#1483). Cancellation is cooperative, matching
         // CancellationToken's use everywhere else in this crate: the
-        // token is exposed to the handler via
-        // `ClientHandler::current_cancellation_token` for it to check or
-        // await, and separately, once the handler returns, its result is
-        // discarded and no reply is sent if the token ended up cancelled
-        // -- so a handler that never looks at the token still never
-        // answers a request the server gave up on. The reply itself goes
-        // out through the transport the loop owns, relayed over
-        // `server_request_tx`.
+        // handler can check or await the token via
+        // `ClientHandler::current_cancellation_token` and read the wire ID
+        // via `ClientHandler::current_request_id`. Once the handler returns,
+        // a cancelled token suppresses its reply even if the handler ignored
+        // the token. Otherwise `server_request_tx` relays the reply to the
+        // message loop for sending over the transport.
         let token = crate::context::CancellationToken::new();
         pending_server_requests.insert(id.clone(), token.clone());
 
@@ -4026,7 +4024,8 @@ async fn handle_incoming<T: ClientTransport, H: ClientHandler>(
         let task_id = id.clone();
         let task_token = token.clone();
         tokio::spawn(async move {
-            let result = handler::scoped_cancellation(
+            let result = handler::scoped_server_request(
+                task_id.clone(),
                 task_token.clone(),
                 dispatch_server_request(&task_handler, &task_roots, &method, params),
             )
