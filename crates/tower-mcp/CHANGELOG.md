@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.29.0] - 2026-11-27
+
+### Bug Fixes
+
+- **oauth:** Enforce the configured JWT audience ([#1689](https://github.com/joshrotenberg/tower-mcp/pull/1689))
+- **router:** Reject cursors on unpaginated listings ([#1690](https://github.com/joshrotenberg/tower-mcp/pull/1690))
+- **client:** Recover from legacy SSE listener session expiry ([#1691](https://github.com/joshrotenberg/tower-mcp/pull/1691))
+- **client:** Resolve 2026-07-28 input requests off the message loop ([#1708](https://github.com/joshrotenberg/tower-mcp/pull/1708))
+- **server:** Send notifications/cancelled when an outgoing elicitation or sampling request is abandoned ([#1707](https://github.com/joshrotenberg/tower-mcp/pull/1707))
+- **channel:** Forward client notifications/cancelled to the router ([#1711](https://github.com/joshrotenberg/tower-mcp/pull/1711))
+- **websocket:** Dispatch requests off the socket loop so handlers can sample and elicit ([#1712](https://github.com/joshrotenberg/tower-mcp/pull/1712))
+
+### Documentation
+
+- **client:** Demonstrate host-mediated elicitation and sampling ([#1701](https://github.com/joshrotenberg/tower-mcp/pull/1701))
+
+### Features
+
+- [**breaking**] **oauth:** Migrate JWT validation to jsonwebtoken 12 ([#1681](https://github.com/joshrotenberg/tower-mcp/pull/1681))
+- **client:** Reusable pre-dispatch tool-call policy hook ([#1702](https://github.com/joshrotenberg/tower-mcp/pull/1702))
+- **client:** Expose the server request id to ClientHandler ([#1706](https://github.com/joshrotenberg/tower-mcp/pull/1706))
+
+
+
 ## [0.28.0] - 2026-11-24
 
 ### Bug Fixes
