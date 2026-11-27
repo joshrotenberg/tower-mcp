@@ -64,34 +64,37 @@ use crate::protocol::{
 use crate::tasks::TaskStatusNotificationParams;
 use tower_mcp_types::JsonRpcError;
 
-tokio::task_local! {
-    /// Cancellation token for whichever server-initiated request the
-    /// current task is dispatching, if any.
-    ///
-    /// Scoped by [`scoped_cancellation`] around each spawned
-    /// `dispatch_server_request` call in the client's message loop, so
-    /// concurrent server-initiated requests each see only their own
-    /// token through [`ClientHandler::current_cancellation_token`].
-    static CURRENT_CANCELLATION: crate::context::CancellationToken;
+struct ServerRequestContext {
+    id: RequestId,
+    cancellation_token: crate::context::CancellationToken,
 }
 
-/// Runs `fut` with `token` available to
-/// [`ClientHandler::current_cancellation_token`].
-///
-/// Internal to the client's message loop (#1483). Each server-initiated
-/// request (`sampling/createMessage`, `elicitation/create`, `roots/list`)
-/// runs on its own task so a `notifications/cancelled` for it can be acted
-/// on without waiting for the handler to return; this scopes that task's
-/// [`CancellationToken`](crate::context::CancellationToken) to the
-/// duration of the handler call so the handler can observe it.
-pub(crate) async fn scoped_cancellation<F>(
-    token: crate::context::CancellationToken,
+tokio::task_local! {
+    /// The wire ID and cancellation token for the server request being
+    /// dispatched on this task, scoped to a single dispatch.
+    static CURRENT_SERVER_REQUEST: ServerRequestContext;
+}
+
+/// Makes the request ID and cancellation token available for one dispatch.
+/// Each server request runs on its own task so the message loop can deliver
+/// `notifications/cancelled` while the handler is still running (#1483).
+pub(crate) async fn scoped_server_request<F>(
+    id: RequestId,
+    cancellation_token: crate::context::CancellationToken,
     fut: F,
 ) -> F::Output
 where
     F: std::future::Future,
 {
-    CURRENT_CANCELLATION.scope(token, fut).await
+    CURRENT_SERVER_REQUEST
+        .scope(
+            ServerRequestContext {
+                id,
+                cancellation_token,
+            },
+            fut,
+        )
+        .await
 }
 
 /// Notification sent from the server to the client.
@@ -168,12 +171,11 @@ pub enum ServerNotification {
 ///
 /// On the 2026-07-28 lifecycle there are no server-initiated requests. The
 /// automatic `input_required` handling in [`McpClient::call_tool`] and its
-/// siblings calls these same methods from the client's message loop, one input
-/// at a time, and without a cancellation token. A handler that waits on a
-/// person or an external host should drive that lifecycle with
-/// [`McpClient::call_tool_once`] or [`McpClient::call_tool_once_task_aware`]
-/// instead. The `host_mediated_input` example in the repository shows both
-/// lifecycles answered through a host's own UI or model.
+/// siblings calls these same methods without a cancellation token or a wire
+/// request ID. A handler that waits on a person or an external host can
+/// drive that lifecycle with [`McpClient::call_tool_once`] or
+/// [`McpClient::call_tool_once_task_aware`]. The `host_mediated_input` example
+/// shows both lifecycles answered through a host's own UI or model.
 ///
 /// The unit type `()` implements this trait with all defaults, which is
 /// used by [`McpClient::connect()`](super::McpClient::connect).
@@ -261,7 +263,22 @@ pub trait ClientHandler: Send + Sync + 'static {
     /// [`handle_elicit`]: Self::handle_elicit
     /// [`handle_list_roots`]: Self::handle_list_roots
     fn current_cancellation_token(&self) -> Option<crate::context::CancellationToken> {
-        CURRENT_CANCELLATION.try_with(Clone::clone).ok()
+        CURRENT_SERVER_REQUEST
+            .try_with(|request| request.cancellation_token.clone())
+            .ok()
+    }
+
+    /// Returns the JSON-RPC ID of the server-initiated request being handled.
+    ///
+    /// Like [`current_cancellation_token`](Self::current_cancellation_token),
+    /// the ID is scoped to the task dispatching the request. Returns `None`
+    /// outside that dispatch, including in notification callbacks and in
+    /// tasks spawned by the handler. Automatic 2026-07-28 input resolution
+    /// also returns `None` here because it has no JSON-RPC request ID of its own.
+    fn current_request_id(&self) -> Option<RequestId> {
+        CURRENT_SERVER_REQUEST
+            .try_with(|request| request.id.clone())
+            .ok()
     }
 }
 
