@@ -70,7 +70,7 @@ use crate::context::{
 };
 use crate::error::Result;
 use crate::jsonrpc::JsonRpcService;
-use crate::protocol::{JsonRpcRequest, JsonRpcResponse, McpNotification, RequestId};
+use crate::protocol::{JsonRpcRequest, JsonRpcResponse, McpNotification, RequestId, notifications};
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
 use crate::transport::pending::{
     PendingClientRequests, abandon_channel, cancelled_notification_json,
@@ -91,9 +91,27 @@ use super::transport::ClientTransport;
 ///
 /// # Cancellation
 ///
-/// A client's `notifications/cancelled` is not forwarded to the router, so
-/// cancelling a call from the client does not cancel its handler on this
-/// transport. In the other direction, a server-to-client request
+/// A client's `notifications/cancelled` is forwarded to the router, so the
+/// handler of the request it names observes cancellation through its
+/// [`RequestContext`](crate::RequestContext), and the request is then left
+/// unanswered, as MCP asks. Each channel tracks its requests in its own
+/// registry, so a cancellation reaches only requests sent on the same
+/// channel, even when several channels serve one router.
+///
+/// A request can be cancelled while the router has it registered: from when
+/// the router registers the request's context until it unregisters the
+/// request's dispatch. A cancellation that arrives outside that window is
+/// ignored, including one for a request still making its way through
+/// middleware or not yet registered by the router.
+///
+/// Only a `notifications/cancelled` frame whose `jsonrpc` is `"2.0"` is
+/// acted on; any other is ignored.
+///
+/// A cancellation that names an active `subscriptions/listen` stream closes
+/// that stream. When the id is shared by an active stream and a registered
+/// request on the same channel, the cancellation reaches both.
+///
+/// In the other direction, a server-to-client request
 /// (sampling, elicitation) that its handler abandons after it was sent is
 /// cancelled with `notifications/cancelled` on the response stream.
 pub struct ChannelTransport {
@@ -125,16 +143,23 @@ impl ChannelTransport {
         Self::with_notifications(router, notification_rx)
     }
 
-    /// Attach a client requester so handlers can call back to the client.
+    /// Prepare the router this channel serves. Must run before the router is
+    /// wrapped by a service or layer, so the reader and the dispatch service
+    /// hold the same prepared router.
     ///
-    /// Server-initiated requests (elicitation, sampling) need a route from
+    /// Attaches a client requester so handlers can call back to the client:
+    /// server-initiated requests (elicitation, sampling) need a route from
     /// the handler back out to the client. The stdio, HTTP, and WebSocket
-    /// transports build one; this does the same for the in-process path, and
-    /// must run before the router is wrapped by a service or layer.
-    fn with_client_requester(router: McpRouter) -> (McpRouter, OutgoingRequestReceiver) {
+    /// transports build one; this does the same for the in-process path.
+    ///
+    /// Also gives the channel its own in-flight registry, so a client's
+    /// `notifications/cancelled` cannot reach a request with the same id on
+    /// another channel built from the same router (#1710).
+    fn connection_router(router: McpRouter) -> (McpRouter, OutgoingRequestReceiver) {
         let (request_tx, request_rx) = outgoing_request_channel(32);
         let requester: ClientRequesterHandle = Arc::new(ChannelClientRequester::new(request_tx));
-        (router.with_client_requester(requester), request_rx)
+        let router = router.with_own_in_flight().with_client_requester(requester);
+        (router, request_rx)
     }
 
     /// Create a channel transport with a caller-owned notification receiver.
@@ -152,7 +177,7 @@ impl ChannelTransport {
     ///
     /// [`HttpTransport::with_notifications`]: crate::transport::HttpTransport::with_notifications
     pub fn with_notifications(router: McpRouter, notification_rx: NotificationReceiver) -> Self {
-        let (router, request_rx) = Self::with_client_requester(router);
+        let (router, request_rx) = Self::connection_router(router);
         let service = JsonRpcService::new(router.clone());
         Self::spawn_with_service(router, service, notification_rx, request_rx)
     }
@@ -166,8 +191,12 @@ impl ChannelTransport {
     /// it would over stdio or HTTP. Layers that produce errors are wrapped
     /// with [`CatchError`] and tool-annotation injection is preserved.
     ///
-    /// `subscriptions/listen` remains transport-owned on every transport and
-    /// does not pass through the layer (#1182 tracks that boundary).
+    /// The transport owns `subscriptions/listen` streams: it registers them,
+    /// filters notifications into them, and closes them. The listen request
+    /// itself is dispatched through the layer, so middleware sees it (#1182).
+    /// The channel waits for that dispatch before it reads the next frame, so
+    /// a slow layer delays the frames, including notifications, that follow
+    /// a listen request.
     ///
     /// [`StdioTransport::layer`]: crate::transport::StdioTransport::layer
     pub fn layer<L>(router: McpRouter, layer: L) -> Self
@@ -195,7 +224,7 @@ impl ChannelTransport {
         <L::Service as Service<RouterRequest>>::Error: std::fmt::Display + Send,
         <L::Service as Service<RouterRequest>>::Future: Send,
     {
-        let (router, request_rx) = Self::with_client_requester(router);
+        let (router, request_rx) = Self::connection_router(router);
         let annotations = router.tool_annotations_map();
         let wrapped = layer.layer(router.clone());
         let service = InjectAnnotations::new(CatchError::new(wrapped), annotations);
@@ -212,7 +241,7 @@ impl ChannelTransport {
     ///
     /// The router is retained alongside the service for transport metadata
     /// only: server identity and tasks opt-in for subscription handling, and
-    /// the `notifications/initialized` forward. Requests dispatch through
+    /// the client notification forward. Requests dispatch through
     /// `service`, never through the router directly, so a wrapping layer sees
     /// every request.
     fn spawn_with_service<S>(
@@ -357,6 +386,16 @@ impl ChannelTransport {
                         continue;
                     }
                 };
+                // Gate both cancellation lookups (the listen-stream registry
+                // and the router) on a JSON-RPC 2.0 envelope. The shared
+                // parser accepts any string `jsonrpc`, and stdio keeps that
+                // behavior, so the check lives here.
+                if is_non_2_0_cancellation(&parsed) {
+                    tracing::debug!(
+                        "ChannelTransport: ignoring a notifications/cancelled that is not JSON-RPC 2.0"
+                    );
+                    continue;
+                }
                 #[cfg(feature = "stateless")]
                 {
                     // The registry lock is never held across an await: the
@@ -373,7 +412,15 @@ impl ChannelTransport {
                                     return;
                                 }
                             }
-                            continue;
+                            // A handled notification is a
+                            // `notifications/cancelled` that closed a listen
+                            // stream. It still goes to the router below: an
+                            // ordinary request in flight under the same id
+                            // is cancelled too, rather than the stream
+                            // consuming the cancellation.
+                            if parsed.get("id").is_some() {
+                                continue;
+                            }
                         }
                         Some(Ok(StdioSubscriptionInput::Dispatch(request))) => {
                             let request_id = request.id.clone();
@@ -420,11 +467,15 @@ impl ChannelTransport {
                 }
 
                 if parsed.get("id").is_none() {
-                    if parsed.get("method").and_then(|m| m.as_str())
-                        == Some("notifications/initialized")
-                    {
-                        router.handle_notification(McpNotification::Initialized);
-                    }
+                    // Every client notification goes to the router, as on
+                    // stdio: `notifications/cancelled` reaches the in-flight
+                    // request it names (#1710), and the rest are the
+                    // router's to handle or log. Handled inline, so a
+                    // cancellation does not wait for a spawned request to
+                    // finish. It can still wait behind a
+                    // `subscriptions/listen` request, which this loop
+                    // dispatches inline above.
+                    forward_notification(&router, &parsed);
                     // No response for notifications
                     continue;
                 }
@@ -443,10 +494,13 @@ impl ChannelTransport {
                 let mut service = service.clone();
                 let response_out = response_tx.clone();
                 tokio::spawn(async move {
-                    let response = service.call_single(req).await;
+                    let response = service.call_single_answerable(req).await;
 
                     let json = match response {
-                        Ok(resp) => match serde_json::to_string(&resp) {
+                        // The client cancelled it; MCP asks us not to answer
+                        // (#1547).
+                        Ok(None) => return,
+                        Ok(Some(resp)) => match serde_json::to_string(&resp) {
                             Ok(j) => j,
                             Err(e) => {
                                 tracing::error!(
@@ -496,6 +550,36 @@ impl ChannelTransport {
     }
 }
 
+/// Whether a frame is a `notifications/cancelled` notification whose
+/// `jsonrpc` is anything other than `"2.0"`, including missing.
+fn is_non_2_0_cancellation(frame: &serde_json::Value) -> bool {
+    frame.get("id").is_none()
+        && frame.get("method").and_then(serde_json::Value::as_str) == Some(notifications::CANCELLED)
+        && frame.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0")
+}
+
+/// Hand a client notification frame to the router.
+///
+/// The frame is parsed with
+/// [`parse_notification_frame`](crate::transport::stdio::parse_notification_frame),
+/// the same envelope parse the listen-stream registry applies, so the two
+/// agree on which frames are a `notifications/cancelled`: one the registry
+/// skips cannot cancel a request here either.
+///
+/// The one exception is `notifications/initialized` without the `jsonrpc`
+/// marker, which this transport has always honored and still does.
+fn forward_notification(router: &McpRouter, frame: &serde_json::Value) {
+    if let Some(notification) = crate::transport::stdio::parse_notification_frame(frame) {
+        router.handle_notification(notification);
+    } else if frame.get("method").and_then(serde_json::Value::as_str)
+        == Some(notifications::INITIALIZED)
+    {
+        router.handle_notification(McpNotification::Initialized);
+    } else {
+        tracing::debug!("ChannelTransport: ignoring a malformed notification");
+    }
+}
+
 #[async_trait]
 impl ClientTransport for ChannelTransport {
     async fn send(&mut self, message: &str) -> Result<()> {
@@ -524,5 +608,58 @@ impl ClientTransport for ChannelTransport {
         self.connected = false;
         self.closed.cancel();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::SessionPhase;
+
+    /// `notifications/initialized` without the `jsonrpc` marker completed the
+    /// handshake on this transport before #1710 and still does, although the
+    /// shared envelope parse rejects the frame.
+    #[tokio::test]
+    async fn markerless_initialized_still_completes_the_handshake() {
+        let router = McpRouter::new().server_info("channel-unit", "0.0.0");
+        let mut service = JsonRpcService::new(router.clone());
+        let initialize: JsonRpcRequest = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "t", "version": "0"}
+            }
+        }))
+        .unwrap();
+        service.call_single(initialize).await.unwrap();
+        assert_eq!(router.session_phase(), SessionPhase::Initializing);
+
+        let markerless = serde_json::json!({"method": "notifications/initialized"});
+        assert!(crate::transport::stdio::parse_notification_frame(&markerless).is_none());
+        forward_notification(&router, &markerless);
+        assert_eq!(router.session_phase(), SessionPhase::Initialized);
+    }
+
+    /// The registry skips a `notifications/cancelled` without the `jsonrpc`
+    /// marker, so the router forward must skip it too.
+    #[test]
+    fn markerless_cancellation_is_not_parsed() {
+        let markerless = serde_json::json!({
+            "method": "notifications/cancelled",
+            "params": {"requestId": 7}
+        });
+        assert!(crate::transport::stdio::parse_notification_frame(&markerless).is_none());
+        let marked = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": 7}
+        });
+        assert!(matches!(
+            crate::transport::stdio::parse_notification_frame(&marked),
+            Some(McpNotification::Cancelled(_))
+        ));
     }
 }

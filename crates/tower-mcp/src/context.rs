@@ -1037,13 +1037,10 @@ impl RequestContext {
     /// registers the request, just before writing it: a request whose waiter
     /// is already gone by then is not sent. One whose waiter goes away while
     /// the write is in progress (for example while the transport waits for
-    /// buffer space) is still sent, and then cancelled. Two transport
-    /// limitations apply:
-    /// [`ChannelTransport`](crate::client::ChannelTransport) does not deliver
-    /// a client's `notifications/cancelled` to the handler, and the
-    /// bidirectional `WebSocketTransport` dispatches requests inline, so
-    /// there this request must be issued from a spawned task to be written
-    /// before the handler returns.
+    /// buffer space) is still sent, and then cancelled. One transport
+    /// limitation applies: the bidirectional `WebSocketTransport` dispatches
+    /// requests inline, so there this request must be issued from a spawned
+    /// task to be written before the handler returns.
     ///
     pub async fn sample(&self, params: CreateMessageParams) -> Result<CreateMessageResult> {
         let requester = self.client_requester.as_ref().ok_or_else(|| {
