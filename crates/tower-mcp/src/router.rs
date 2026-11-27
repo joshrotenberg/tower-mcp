@@ -1387,7 +1387,13 @@ impl McpRouter {
         // Adopt a transport-provided cancellation token (e.g. HTTP stateless
         // client disconnect) so `ctx.is_cancelled()` / `ctx.cancelled()` and
         // in-flight tracking observe the transport's signal.
-        let ctx = if let Some(token) = merged.get::<CancellationToken>() {
+        // The token used to admit a WebSocket request takes precedence over
+        // an extension token so the context observes socket close and peer
+        // cancellation through the same token already in the registry.
+        let peer_cancelled = per_request.get::<PeerCancelled>();
+        let admitted_token = peer_cancelled.and_then(PeerCancelled::admitted_token);
+        let ctx = if let Some(token) = admitted_token.or_else(|| merged.get::<CancellationToken>())
+        {
             ctx.with_cancellation_token(token.clone())
         } else if let Some(connection) = merged.get::<ConnectionCancellation>() {
             ctx.with_cancellation_token(connection.0.child_token())
@@ -1406,16 +1412,18 @@ impl McpRouter {
         // dispatch id and threads it through the extensions so the guard it
         // holds and this registration name the same entry; a caller driving
         // the router directly gets a fresh one.
-        let dispatch = per_request
-            .get::<DispatchId>()
-            .copied()
-            .unwrap_or_else(|| self.next_dispatch());
-        self.register_in_flight(
-            request_id,
-            dispatch,
-            ctx.cancellation_token(),
-            per_request.get::<PeerCancelled>().cloned(),
-        );
+        if admitted_token.is_none() {
+            let dispatch = per_request
+                .get::<DispatchId>()
+                .copied()
+                .unwrap_or_else(|| self.next_dispatch());
+            self.register_in_flight(
+                request_id,
+                dispatch,
+                ctx.cancellation_token(),
+                peer_cancelled.cloned(),
+            );
+        }
 
         ctx
     }
@@ -1427,6 +1435,39 @@ impl McpRouter {
                 .next_dispatch
                 .fetch_add(1, AtomicOrdering::Relaxed),
         )
+    }
+
+    /// Register before the dispatch task can yield or wait for middleware.
+    #[cfg(feature = "websocket")]
+    pub(crate) fn admit_request(
+        &self,
+        request_id: RequestId,
+        connection: &CancellationToken,
+    ) -> (PeerCancelled, InFlightGuard) {
+        let dispatch = self.next_dispatch();
+        let token = connection.child_token();
+        let peer = PeerCancelled {
+            marked: Arc::default(),
+            admitted_token: Some(token.clone()),
+        };
+        self.register_in_flight(request_id.clone(), dispatch, token, Some(peer.clone()));
+        let guard = InFlightGuard {
+            router: self.clone(),
+            request_id,
+            dispatch,
+        };
+        (peer, guard)
+    }
+
+    #[cfg(all(test, feature = "websocket"))]
+    pub(crate) fn in_flight_request_count(&self) -> usize {
+        self.inner
+            .in_flight
+            .read()
+            .unwrap()
+            .values()
+            .map(Vec::len)
+            .sum()
     }
 
     /// Track one dispatch for cancellation.
@@ -1497,10 +1538,10 @@ impl McpRouter {
             return false;
         };
         for entry in entries {
-            entry.token.cancel();
             if let Some(peer_cancelled) = &entry.peer_cancelled {
                 peer_cancelled.mark();
             }
+            entry.token.cancel();
         }
         !entries.is_empty()
     }
@@ -1750,19 +1791,15 @@ impl McpRouter {
     /// A transport that hand-builds an error response is outside every path
     /// that consults [`PanicPolicy`], so before this existed it sent the
     /// error's `Display` text whatever the operator had configured (#1354).
-    /// Routing the two websocket sites through one helper rather than
-    /// widening the panic path is what keeps the next transport from
-    /// reintroducing the gap: the previous round of this, #1335, fixed one of
-    /// a pair of near-identical sites and left the other to drift.
+    /// WebSocket transport failures use this helper so the disclosure
+    /// policy applies consistently across dispatch paths.
     ///
-    /// With no policy installed the error's text is returned unchanged, which
-    /// is both the behaviour these paths already had and the stance the crate
-    /// takes elsewhere: a panic is not caught at all until `catch_panics` asks
-    /// for it.
+    /// With no policy installed the error's text is returned unchanged.
+    /// Callers reporting a dispatch-task panic supply a fixed message to keep
+    /// the panic payload in the server log.
     ///
-    /// Gated on `websocket` because that is where the two sites are. Widen the
-    /// gate rather than duplicating the decision when another transport needs
-    /// it, which is the whole point of it being one helper.
+    /// Gated on `websocket`. Widen the gate if another transport adopts
+    /// this error path.
     #[cfg(feature = "websocket")]
     pub(crate) fn transport_internal_error(&self, error: &dyn std::fmt::Display) -> JsonRpcError {
         match &self.inner.panic_policy {
@@ -3800,15 +3837,24 @@ struct DispatchId(u64);
 /// reads it once the response is produced. The flag lives only as long as the
 /// request future and its registry entry, so there is nothing to clear.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct PeerCancelled(Arc<AtomicBool>);
+pub(crate) struct PeerCancelled {
+    marked: Arc<AtomicBool>,
+    /// A dispatch admitted before its service future starts already has
+    /// a registry entry and a connection-scoped token.
+    admitted_token: Option<CancellationToken>,
+}
 
 impl PeerCancelled {
+    fn admitted_token(&self) -> Option<&CancellationToken> {
+        self.admitted_token.as_ref()
+    }
+
     pub(crate) fn mark(&self) {
-        self.0.store(true, AtomicOrdering::Release);
+        self.marked.store(true, AtomicOrdering::Release);
     }
 
     pub(crate) fn is_marked(&self) -> bool {
-        self.0.load(AtomicOrdering::Acquire)
+        self.marked.load(AtomicOrdering::Acquire)
     }
 }
 
@@ -3837,7 +3883,7 @@ struct InFlightDispatch {
 /// dropped before that point (a timeout layer firing, an HTTP client
 /// disconnecting, a handler unwinding) left its entry in the registry for the
 /// process lifetime. `Drop` runs on every one of those paths.
-struct InFlightGuard {
+pub(crate) struct InFlightGuard {
     router: McpRouter,
     request_id: RequestId,
     dispatch: DispatchId,
@@ -3864,17 +3910,25 @@ impl Service<RouterRequest> for McpRouter {
         let router = self.clone();
         let request_id = req.id.clone();
 
-        // Name the dispatch before `handle` builds its context, so the
-        // registration inside and the guard out here refer to the same entry.
-        let dispatch = router.next_dispatch();
-        req.extensions.insert(dispatch);
+        // Requests admitted by the transport already have a guard. Otherwise
+        // name the dispatch so its context and this guard share the same entry.
+        let admitted = req
+            .extensions
+            .get::<PeerCancelled>()
+            .and_then(PeerCancelled::admitted_token)
+            .is_some();
+        let dispatch = (!admitted).then(|| {
+            let dispatch = router.next_dispatch();
+            req.extensions.insert(dispatch);
+            dispatch
+        });
 
         Box::pin(async move {
-            let _tracked = InFlightGuard {
+            let _tracked = dispatch.map(|dispatch| InFlightGuard {
                 router: router.clone(),
                 request_id: request_id.clone(),
                 dispatch,
-            };
+            });
             let result = router.handle(req.id, req.inner, req.extensions).await;
             Ok(RouterResponse {
                 id: request_id,
