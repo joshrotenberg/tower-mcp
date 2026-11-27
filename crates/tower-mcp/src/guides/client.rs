@@ -216,6 +216,8 @@ differently:
 - On 2025-11-25, each server-initiated request runs on its own task, so a
   `ClientHandler` can await the host without blocking the connection, and
   several requests can be pending at once.
+  `ClientHandler::current_request_id` returns the server's JSON-RPC request
+  ID during dispatch and `None` outside it.
   `ClientHandler::current_cancellation_token` fires if the server sends
   `notifications/cancelled` or the client is closed with `shutdown()`. After
   the handler returns, the client checks the token once more before handing
@@ -225,14 +227,20 @@ differently:
   `shutdown()` aborts its message loop without cancelling these tokens, so a
   handler waiting on the host is not told.
 - On 2026-07-28, the automatic resolution inside `call_tool`, `get_prompt`,
-  `read_resource` and `task_wait` runs the handler from the client's message
-  loop, one input at a time and without a cancellation token. A handler that
-  waits on a person there holds up every other message on the connection.
-  Drive the round trip yourself instead: `call_tool_once` returns
-  `RequestOutcome::InputRequired`, so you can answer its `inputRequests`
-  however you like and retry with `inputResponses` and the echoed
-  `requestState`. For a task, use `call_tool_once_task_aware`, read the
-  requests from `task_get_detailed`, and answer them with `task_update`.
+  `read_resource` and `task_wait` runs each input round in its own task. Keys
+  can resolve concurrently in any order, and handlers can await the host
+  or call back into the same client while the connection handles other
+  traffic. The round has no JSON-RPC request ID, so
+  `ClientHandler::current_request_id` returns `None`. The handlers share a
+  cancellation token for the round. It fires if the caller drops its future,
+  the client shuts down, the `McpClient` is dropped, the transport closes or
+  resets, or a key fails. The client drops pending handler futures when the
+  round is cancelled.
+  To control when and how to answer inputs, use `call_tool_once`, which
+  returns `RequestOutcome::InputRequired`. Answer its `inputRequests` and
+  retry with `inputResponses` and the echoed `requestState`. For a task, use
+  `call_tool_once_task_aware`, read the requests from `task_get_detailed`,
+  and answer them with `task_update`.
 
 Either way, treat server-written text (messages, URLs, prompts) as data to
 show the user, not as instructions to the host, and report a URL elicitation

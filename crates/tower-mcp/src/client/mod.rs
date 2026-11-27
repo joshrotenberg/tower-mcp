@@ -111,10 +111,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::ProtocolSupport;
+use crate::context::CancellationToken;
 use crate::error::{Error, ErrorCode, McpErrorCode, Result};
 #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
 use crate::protocol::DiscoverParams;
@@ -325,6 +327,7 @@ enum LoopCommand {
     },
     /// Fulfil embedded MRTR requests through the configured client handler.
     ResolveInputs {
+        generation: u64,
         requests: InputRequests,
         response_tx: oneshot::Sender<Result<InputResponses>>,
     },
@@ -1478,7 +1481,8 @@ impl McpClient {
     ) -> Result<CallToolResult> {
         let mut input_responses = None;
         let mut request_state = None;
-        let mut schema_retry_available = self.session.uses_final_protocol().await;
+        let generation = self.session.final_generation().await;
+        let mut schema_retry_available = generation.is_some();
         for round in 0..=self.max_mrtr_rounds {
             let params = CallToolParams {
                 name: name.to_string(),
@@ -1492,13 +1496,14 @@ impl McpClient {
                 .send_task_aware_tool_request_with_schema_retry(
                     &params,
                     &mut schema_retry_available,
+                    generation,
                 )
                 .await?;
             match outcome {
                 TaskAwareCallToolOutcome::Complete(result) => return Ok(result),
                 TaskAwareCallToolOutcome::Task(created) => {
                     return self
-                        .complete_final_task(&created.task.metadata.task_id)
+                        .complete_final_task(&created.task.metadata.task_id, generation)
                         .await;
                 }
                 TaskAwareCallToolOutcome::InputRequired(required) => {
@@ -1514,7 +1519,8 @@ impl McpClient {
                                 .to_string(),
                         )
                     })?;
-                    input_responses = Some(self.resolve_input_requests(requests).await?);
+                    input_responses =
+                        Some(self.resolve_input_requests(generation, requests).await?);
                     request_state = required.request_state;
                 }
             }
@@ -1567,8 +1573,12 @@ impl McpClient {
             task: None,
         };
         let mut schema_retry_available = self.session.uses_final_protocol().await;
-        self.send_task_aware_tool_request_with_schema_retry(&params, &mut schema_retry_available)
-            .await
+        self.send_task_aware_tool_request_with_schema_retry(
+            &params,
+            &mut schema_retry_available,
+            None,
+        )
+        .await
     }
 
     /// Request direct control of a tool task lifecycle.
@@ -1610,6 +1620,7 @@ impl McpClient {
                 .send_task_aware_tool_request_with_schema_retry(
                     &params,
                     &mut schema_retry_available,
+                    None,
                 )
                 .await?
             {
@@ -1635,7 +1646,7 @@ impl McpClient {
             task: Some(TaskRequestParams { ttl: ttl_ms }),
         };
         let mut schema_retry_available = self.session.uses_final_protocol().await;
-        self.send_tool_request_with_schema_retry(&params, &mut schema_retry_available)
+        self.send_tool_request_with_schema_retry(&params, &mut schema_retry_available, None)
             .await
     }
 
@@ -1668,6 +1679,14 @@ impl McpClient {
     /// `inputRequests`. It is available only after selecting the 2026-07-28
     /// lifecycle; legacy callers should use [`task_get`](Self::task_get).
     pub async fn task_get_detailed(&self, task_id: &str) -> Result<crate::tasks::GetTaskResult> {
+        self.task_get_detailed_in_generation(task_id, None).await
+    }
+
+    async fn task_get_detailed_in_generation(
+        &self,
+        task_id: &str,
+        generation: Option<u64>,
+    ) -> Result<crate::tasks::GetTaskResult> {
         self.ensure_initialized()?;
         if !self.session.uses_final_protocol().await {
             return Err(Error::Transport(
@@ -1678,7 +1697,8 @@ impl McpClient {
             task_id: task_id.to_string(),
             meta: None,
         };
-        self.send_request("tasks/get", &params).await
+        self.send_request_in_generation(generation, "tasks/get", &params)
+            .await
     }
 
     /// Cancel a task via `tasks/cancel` (SEP-2663).
@@ -1725,6 +1745,16 @@ impl McpClient {
     /// The acknowledgment carries no data and is discarded. Poll
     /// [`task_get`](Self::task_get) to observe the resulting state.
     pub async fn task_update(&self, task_id: &str, input_responses: InputResponses) -> Result<()> {
+        self.task_update_in_generation(task_id, input_responses, None)
+            .await
+    }
+
+    async fn task_update_in_generation(
+        &self,
+        task_id: &str,
+        input_responses: InputResponses,
+        generation: Option<u64>,
+    ) -> Result<()> {
         self.ensure_initialized()?;
         if self.session.uses_final_protocol().await {
             let params = crate::tasks::UpdateTaskParams {
@@ -1732,8 +1762,9 @@ impl McpClient {
                 input_responses,
                 meta: None,
             };
-            let _ack: crate::tasks::UpdateTaskResult =
-                self.send_request("tasks/update", &params).await?;
+            let _ack: crate::tasks::UpdateTaskResult = self
+                .send_request_in_generation(generation, "tasks/update", &params)
+                .await?;
             return Ok(());
         }
         let input_responses = input_responses
@@ -1765,8 +1796,9 @@ impl McpClient {
     /// task, where each `notifications/tasks` carries the whole task and a
     /// completion arrives with its result already attached.
     pub async fn task_wait(&self, task_id: &str) -> Result<TaskObject> {
-        if self.session.uses_final_protocol().await {
-            let result = self.wait_for_final_task(task_id).await?;
+        let generation = self.session.final_generation().await;
+        if generation.is_some() {
+            let result = self.wait_for_final_task(task_id, generation).await?;
             return Self::legacy_task_from_final(result);
         }
         loop {
@@ -1787,8 +1819,8 @@ impl McpClient {
     /// Read a resource.
     pub async fn read_resource(&self, uri: &str) -> Result<ReadResourceResult> {
         self.ensure_initialized()?;
-        let cache_enabled =
-            self.session.uses_final_protocol().await && self.response_cache.enabled();
+        let request_generation = self.session.final_generation().await;
+        let cache_enabled = request_generation.is_some() && self.response_cache.enabled();
         let generation = if cache_enabled {
             self.response_cache
                 .capture_generation("resources/read", uri)
@@ -1819,7 +1851,12 @@ impl McpClient {
         let mut followed_input_required = false;
         for round in 0..=self.max_mrtr_rounds {
             let outcome = match self
-                .read_resource_once(uri, input_responses.take(), request_state.take())
+                .read_resource_in_generation(
+                    uri,
+                    input_responses.take(),
+                    request_state.take(),
+                    request_generation,
+                )
                 .await
             {
                 Ok(outcome) => outcome,
@@ -1873,7 +1910,10 @@ impl McpClient {
                                 .to_string(),
                         )
                     })?;
-                    input_responses = Some(self.resolve_input_requests(requests).await?);
+                    input_responses = Some(
+                        self.resolve_input_requests(request_generation, requests)
+                            .await?,
+                    );
                     request_state = required.request_state;
                 }
             }
@@ -1888,6 +1928,17 @@ impl McpClient {
         input_responses: Option<InputResponses>,
         request_state: Option<String>,
     ) -> Result<RequestOutcome<ReadResourceResult>> {
+        self.read_resource_in_generation(uri, input_responses, request_state, None)
+            .await
+    }
+
+    async fn read_resource_in_generation(
+        &self,
+        uri: &str,
+        input_responses: Option<InputResponses>,
+        request_state: Option<String>,
+        generation: Option<u64>,
+    ) -> Result<RequestOutcome<ReadResourceResult>> {
         self.ensure_initialized()?;
         let params = ReadResourceParams {
             uri: uri.to_string(),
@@ -1895,7 +1946,8 @@ impl McpClient {
             request_state,
             meta: None,
         };
-        self.send_request("resources/read", &params).await
+        self.send_request_in_generation(generation, "resources/read", &params)
+            .await
     }
 
     /// Open a final-protocol `subscriptions/listen` notification stream.
@@ -2509,15 +2561,17 @@ impl McpClient {
         arguments: Option<std::collections::HashMap<String, String>>,
     ) -> Result<GetPromptResult> {
         let arguments = arguments.unwrap_or_default();
+        let generation = self.session.final_generation().await;
         let mut input_responses = None;
         let mut request_state = None;
         for round in 0..=self.max_mrtr_rounds {
             match self
-                .get_prompt_once(
+                .get_prompt_in_generation(
                     name,
                     arguments.clone(),
                     input_responses.take(),
                     request_state.take(),
+                    generation,
                 )
                 .await?
             {
@@ -2535,7 +2589,8 @@ impl McpClient {
                                 .to_string(),
                         )
                     })?;
-                    input_responses = Some(self.resolve_input_requests(requests).await?);
+                    input_responses =
+                        Some(self.resolve_input_requests(generation, requests).await?);
                     request_state = required.request_state;
                 }
             }
@@ -2551,6 +2606,18 @@ impl McpClient {
         input_responses: Option<InputResponses>,
         request_state: Option<String>,
     ) -> Result<RequestOutcome<GetPromptResult>> {
+        self.get_prompt_in_generation(name, arguments, input_responses, request_state, None)
+            .await
+    }
+
+    async fn get_prompt_in_generation(
+        &self,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+        input_responses: Option<InputResponses>,
+        request_state: Option<String>,
+        generation: Option<u64>,
+    ) -> Result<RequestOutcome<GetPromptResult>> {
         self.ensure_initialized()?;
         let params = GetPromptParams {
             name: name.to_string(),
@@ -2559,7 +2626,8 @@ impl McpClient {
             request_state,
             meta: None,
         };
-        self.send_request("prompts/get", &params).await
+        self.send_request_in_generation(generation, "prompts/get", &params)
+            .await
     }
 
     /// Ping the server.
@@ -2714,14 +2782,21 @@ impl McpClient {
         &self,
         params: &CallToolParams,
         retry_available: &mut bool,
+        generation: Option<u64>,
     ) -> Result<TaskAwareCallToolOutcome> {
-        self.send_tool_request_with_schema_retry(params, retry_available)
+        self.send_tool_request_with_schema_retry(params, retry_available, generation)
             .await
     }
 
-    async fn wait_for_final_task(&self, task_id: &str) -> Result<crate::tasks::GetTaskResult> {
+    async fn wait_for_final_task(
+        &self,
+        task_id: &str,
+        generation: Option<u64>,
+    ) -> Result<crate::tasks::GetTaskResult> {
         loop {
-            let task = self.task_get_detailed(task_id).await?;
+            let task = self
+                .task_get_detailed_in_generation(task_id, generation)
+                .await?;
             match task.task.status() {
                 crate::protocol::TaskStatus::Completed
                 | crate::protocol::TaskStatus::Failed
@@ -2737,8 +2812,9 @@ impl McpClient {
                             "task '{task_id}' is input_required without inputRequests"
                         )));
                     }
-                    let responses = self.resolve_input_requests(requests).await?;
-                    self.task_update(task_id, responses).await?;
+                    let responses = self.resolve_input_requests(generation, requests).await?;
+                    self.task_update_in_generation(task_id, responses, generation)
+                        .await?;
                 }
                 crate::protocol::TaskStatus::Working => {
                     let interval_ms = task
@@ -2758,8 +2834,12 @@ impl McpClient {
         }
     }
 
-    async fn complete_final_task(&self, task_id: &str) -> Result<CallToolResult> {
-        let task = self.wait_for_final_task(task_id).await?;
+    async fn complete_final_task(
+        &self,
+        task_id: &str,
+        generation: Option<u64>,
+    ) -> Result<CallToolResult> {
+        let task = self.wait_for_final_task(task_id, generation).await?;
         match task.task.status() {
             crate::protocol::TaskStatus::Completed => {
                 let result = task.task.result().cloned().ok_or_else(|| {
@@ -2842,11 +2922,15 @@ impl McpClient {
         &self,
         params: &CallToolParams,
         retry_available: &mut bool,
+        generation: Option<u64>,
     ) -> Result<R>
     where
         R: serde::de::DeserializeOwned,
     {
-        match self.send_request("tools/call", params).await {
+        match self
+            .send_request_in_generation(generation, "tools/call", params)
+            .await
+        {
             Err(error) if *retry_available && is_stale_tool_schema_error(&error) => {
                 *retry_available = false;
                 self.response_cache.evict_method("tools/list").await;
@@ -2863,7 +2947,8 @@ impl McpClient {
                     );
                     return Err(error);
                 }
-                self.send_request("tools/call", params).await
+                self.send_request_in_generation(generation, "tools/call", params)
+                    .await
             }
             result => result,
         }
@@ -3026,6 +3111,24 @@ impl McpClient {
             self.session.send_request_once(generation, method, params)
         })
         .await
+    }
+
+    // Automatic final-protocol input rounds carry state from the response
+    // that started them. Keep using that generation when sending it back.
+    async fn send_request_in_generation<P: serde::Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        generation: Option<u64>,
+        method: &str,
+        params: &P,
+    ) -> Result<R> {
+        match generation {
+            Some(generation) => {
+                self.session
+                    .send_request_once(generation, method, params)
+                    .await
+            }
+            None => self.send_request(method, params).await,
+        }
     }
 
     async fn send_with_session_recovery<R, F>(
@@ -3299,12 +3402,16 @@ impl ClientSession {
 }
 
 impl McpClient {
-    async fn resolve_input_requests(&self, requests: InputRequests) -> Result<InputResponses> {
-        if !self.session.uses_final_protocol().await {
+    async fn resolve_input_requests(
+        &self,
+        generation: Option<u64>,
+        requests: InputRequests,
+    ) -> Result<InputResponses> {
+        let Some(generation) = generation else {
             return Err(Error::Transport(
                 "input_required results require the 2026-07-28 client lifecycle".to_string(),
             ));
-        }
+        };
         for request in requests.values() {
             let declared = match request {
                 InputRequest::CreateMessage(_) => self.session.capabilities.sampling.is_some(),
@@ -3324,14 +3431,13 @@ impl McpClient {
         self.session
             .command_tx
             .send(LoopCommand::ResolveInputs {
+                generation,
                 requests,
                 response_tx,
             })
             .await
             .map_err(|_| Error::Transport("Connection closed".to_string()))?;
-        response_rx
-            .await
-            .map_err(|_| Error::Transport("Connection closed".to_string()))?
+        response_rx.await.map_err(|_| input_resolution_stopped())?
     }
 }
 
@@ -3339,6 +3445,14 @@ impl ClientSession {
     async fn uses_final_protocol(&self) -> bool {
         self.selected_protocol_version.read().await.as_deref()
             == Some(crate::protocol::PROTOCOL_VERSION_2026_07_28)
+    }
+
+    // Pin automatic operations before their first request, including all
+    // task polls, so any inputs they receive belong to the same generation.
+    async fn final_generation(&self) -> Option<u64> {
+        self.uses_final_protocol()
+            .await
+            .then(|| self.generation.load(Ordering::Acquire))
     }
 
     fn request_meta_for(&self, version: &str, client_info: &Implementation) -> RequestMeta {
@@ -3605,6 +3719,17 @@ struct PendingState<'a> {
     pending_server_requests: &'a mut HashMap<RequestId, crate::context::CancellationToken>,
 }
 
+// Cancels any input rounds from this generation, including when the loop is
+// aborted and never reaches its normal cleanup.
+#[derive(Default)]
+struct InputResolutionScope(CancellationToken);
+
+impl Drop for InputResolutionScope {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// Background message loop that multiplexes incoming/outgoing messages.
 async fn message_loop<T: ClientTransport, H: ClientHandler>(
     mut transport: T,
@@ -3624,6 +3749,7 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
     let mut pending_server_requests: HashMap<RequestId, crate::context::CancellationToken> =
         HashMap::new();
     let (mut server_request_tx, mut server_request_rx) = mpsc::channel::<ServerRequestOutcome>(32);
+    let mut input_resolution = InputResolutionScope::default();
 
     loop {
         tokio::select! {
@@ -3772,12 +3898,27 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
                         }
                         let _ = done_tx.send(result);
                     }
-                    Some(LoopCommand::ResolveInputs { requests, response_tx }) => {
-                        let result = resolve_inputs_with_handler(&handler, &roots, requests).await;
-                        let _ = response_tx.send(result);
+                    Some(LoopCommand::ResolveInputs { generation, requests, response_tx }) => {
+                        if response_tx.is_closed() {
+                            continue;
+                        }
+                        if generation != session.generation.load(Ordering::Acquire)
+                            || session.expired.load(Ordering::Acquire)
+                        {
+                            let _ = response_tx.send(Err(input_resolution_stopped()));
+                            continue;
+                        }
+                        let token = input_resolution.0.child_token();
+                        let handler = Arc::clone(&handler);
+                        let roots = Arc::clone(&roots);
+                        tokio::spawn(handler::scoped_input_round(
+                            token.clone(),
+                            resolve_inputs_with_handler(handler, roots, requests, token, response_tx),
+                        ));
                     }
                     Some(LoopCommand::ResetSession { end_on_server, done_tx }) => {
                         tracing::info!(end_on_server, "Resetting transport session");
+                        input_resolution = InputResolutionScope::default();
                         session.initialized.store(false, Ordering::Release);
                         *session.server_info.write().await = None;
                         session.generation.fetch_add(1, Ordering::AcqRel);
@@ -3865,6 +4006,7 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
 
     // Cleanup
     session.connected.store(false, Ordering::Release);
+    drop(input_resolution);
     fail_all_pending(&mut pending_requests, "Connection closed");
     // Stop any server-initiated request tasks still running; their reply
     // would have nowhere to go now that the loop is exiting.
@@ -3880,47 +4022,99 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
     while command_rx.recv().await.is_some() {}
 }
 
+const MAX_CONCURRENT_INPUT_KEYS: usize = 16;
+
 async fn resolve_inputs_with_handler<H: ClientHandler>(
-    handler: &Arc<H>,
-    roots: &Arc<RwLock<Vec<Root>>>,
+    handler: Arc<H>,
+    roots: Arc<RwLock<Vec<Root>>>,
     requests: InputRequests,
-) -> Result<InputResponses> {
-    let mut responses = InputResponses::new();
-    for (key, request) in requests {
-        let response = match request {
-            InputRequest::CreateMessage(params) => InputResponse::CreateMessage(
-                handler
-                    .handle_create_message(params)
-                    .await
-                    .map_err(Error::JsonRpc)?,
-            ),
-            InputRequest::ListRoots(_) => {
-                let configured = roots.read().await.clone();
-                let result = if configured.is_empty() {
-                    handler.handle_list_roots().await.map_err(Error::JsonRpc)?
-                } else {
-                    ListRootsResult {
-                        roots: configured,
-                        meta: None,
-                    }
+    token: CancellationToken,
+    mut response_tx: oneshot::Sender<Result<InputResponses>>,
+) {
+    let mut pending = FuturesUnordered::new();
+    let result = {
+        let mut requests = requests.into_iter();
+        let mut responses = InputResponses::new();
+        loop {
+            while pending.len() < MAX_CONCURRENT_INPUT_KEYS {
+                let Some((key, request)) = requests.next() else {
+                    break;
                 };
-                InputResponse::ListRoots(result)
+                let handler = handler.as_ref();
+                let roots = roots.as_ref();
+                let token = &token;
+                pending.push(async move {
+                    // A future already in the window may have never been polled.
+                    if token.is_cancelled() {
+                        return Err(input_resolution_stopped());
+                    }
+                    let response = resolve_input_with_handler(handler, roots, request).await?;
+                    Ok((key, response))
+                });
             }
-            InputRequest::Elicit(params) => InputResponse::Elicit(
-                handler
-                    .handle_elicit(params)
-                    .await
-                    .map_err(Error::JsonRpc)?,
-            ),
-            _ => {
-                return Err(Error::Transport(
-                    "unsupported MRTR input request method".to_string(),
-                ));
+
+            tokio::select! {
+                biased;
+                _ = response_tx.closed() => break Err(input_resolution_stopped()),
+                _ = token.cancelled() => break Err(input_resolution_stopped()),
+                outcome = pending.next() => match outcome {
+                    Some(Ok((key, response))) => {
+                        responses.insert(key, response);
+                        tokio::task::consume_budget().await;
+                    }
+                    Some(Err(error)) => break Err(error),
+                    None => break Ok(responses),
+                },
             }
-        };
-        responses.insert(key, response);
+        }
+    };
+
+    if result.is_err() {
+        token.cancel();
     }
-    Ok(responses)
+    // Signal spawned work and drop pending handlers without waiting for them.
+    drop(pending);
+    if response_tx.send(result).is_err() {
+        token.cancel();
+    }
+}
+
+fn input_resolution_stopped() -> Error {
+    Error::Transport("Input resolution stopped".to_string())
+}
+
+async fn resolve_input_with_handler<H: ClientHandler>(
+    handler: &H,
+    roots: &RwLock<Vec<Root>>,
+    request: InputRequest,
+) -> Result<InputResponse> {
+    match request {
+        InputRequest::CreateMessage(params) => handler
+            .handle_create_message(params)
+            .await
+            .map(InputResponse::CreateMessage)
+            .map_err(Error::JsonRpc),
+        InputRequest::ListRoots(_) => {
+            let configured = roots.read().await.clone();
+            let result = if configured.is_empty() {
+                handler.handle_list_roots().await.map_err(Error::JsonRpc)?
+            } else {
+                ListRootsResult {
+                    roots: configured,
+                    meta: None,
+                }
+            };
+            Ok(InputResponse::ListRoots(result))
+        }
+        InputRequest::Elicit(params) => handler
+            .handle_elicit(params)
+            .await
+            .map(InputResponse::Elicit)
+            .map_err(Error::JsonRpc),
+        _ => Err(Error::Transport(
+            "unsupported MRTR input request method".to_string(),
+        )),
+    }
 }
 
 /// Handle a single incoming message from the server.
@@ -4009,14 +4203,12 @@ async fn handle_incoming<T: ClientTransport, H: ClientHandler>(
         // otherwise deadlock the message loop that is supposed to answer
         // it (#1483). Cancellation is cooperative, matching
         // CancellationToken's use everywhere else in this crate: the
-        // token is exposed to the handler via
-        // `ClientHandler::current_cancellation_token` for it to check or
-        // await, and separately, once the handler returns, its result is
-        // discarded and no reply is sent if the token ended up cancelled
-        // -- so a handler that never looks at the token still never
-        // answers a request the server gave up on. The reply itself goes
-        // out through the transport the loop owns, relayed over
-        // `server_request_tx`.
+        // handler can check or await the token via
+        // `ClientHandler::current_cancellation_token` and read the wire ID
+        // via `ClientHandler::current_request_id`. Once the handler returns,
+        // a cancelled token suppresses its reply even if the handler ignored
+        // the token. Otherwise `server_request_tx` relays the reply to the
+        // message loop for sending over the transport.
         let token = crate::context::CancellationToken::new();
         pending_server_requests.insert(id.clone(), token.clone());
 
@@ -4026,7 +4218,8 @@ async fn handle_incoming<T: ClientTransport, H: ClientHandler>(
         let task_id = id.clone();
         let task_token = token.clone();
         tokio::spawn(async move {
-            let result = handler::scoped_cancellation(
+            let result = handler::scoped_server_request(
+                task_id.clone(),
                 task_token.clone(),
                 dispatch_server_request(&task_handler, &task_roots, &method, params),
             )

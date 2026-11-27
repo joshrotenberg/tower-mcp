@@ -43,17 +43,17 @@
 //! `shutdown()` aborts the client's message loop without cancelling tokens, so
 //! questions then end at their deadline instead.
 //!
-//! On **2026-07-28** there are no server-initiated requests. The drivers use
-//! [`McpClient::call_tool_once`], [`McpClient::call_tool_once_task_aware`],
-//! [`McpClient::task_get_detailed`] and [`McpClient::task_update`], and send
-//! every entry of `inputRequests` to the host at once. They avoid the
-//! automatic resolution inside [`McpClient::call_tool`], which calls the
-//! [`ClientHandler`] from the client's message loop: a handler waiting on a
-//! person there stalls every other message on the connection. This lifecycle
-//! has no server cancellation signal for an input request, so while the host
-//! decides, the drivers watch three things instead: a [`StopFlag`] the
-//! client's owner sets to end the client's lifetime, the connection state,
-//! and (for tasks) whether the task has reached a terminal status.
+//! On **2026-07-28**, automatic resolution in [`McpClient::call_tool`] and
+//! related methods runs the [`ClientHandler`] off the message loop, with
+//! concurrent keys and a shared cancellation token for the round. This
+//! example drives the rounds explicitly to control how it sends each key to
+//! the host and to watch for task termination while the host decides. The
+//! drivers use [`McpClient::call_tool_once`],
+//! [`McpClient::call_tool_once_task_aware`], [`McpClient::task_get_detailed`]
+//! and [`McpClient::task_update`]. They send every entry of `inputRequests`
+//! to the host at once and watch a [`StopFlag`] set by the client's owner,
+//! the connection state, and (for tasks) whether the task has reached a
+//! terminal status.
 //!
 //! # Identity, bounds and cleanup
 //!
