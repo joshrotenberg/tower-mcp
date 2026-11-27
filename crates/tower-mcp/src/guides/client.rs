@@ -216,6 +216,8 @@ differently:
 - On 2025-11-25, each server-initiated request runs on its own task, so a
   `ClientHandler` can await the host without blocking the connection, and
   several requests can be pending at once.
+  `ClientHandler::current_request_id` returns the server's JSON-RPC request
+  ID during dispatch and `None` outside it.
   `ClientHandler::current_cancellation_token` fires if the server sends
   `notifications/cancelled` or the client is closed with `shutdown()`. After
   the handler returns, the client checks the token once more before handing
@@ -225,10 +227,8 @@ differently:
   `shutdown()` aborts its message loop without cancelling these tokens, so a
   handler waiting on the host is not told.
 - On 2026-07-28, the automatic resolution inside `call_tool`, `get_prompt`,
-  `read_resource` and `task_wait` runs the handler from the client's message
-  loop, one input at a time and without a cancellation token. A handler that
-  waits on a person there holds up every other message on the connection.
-  Drive the round trip yourself instead: `call_tool_once` returns
+  `read_resource` and `task_wait` has no JSON-RPC request ID of its own.
+  To control when to answer inputs, use `call_tool_once`, which returns
   `RequestOutcome::InputRequired`, so you can answer its `inputRequests`
   however you like and retry with `inputResponses` and the echoed
   `requestState`. For a task, use `call_tool_once_task_aware`, read the
