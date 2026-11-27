@@ -273,7 +273,7 @@ use axum::{
 };
 #[cfg(feature = "stateless")]
 use tokio::sync::mpsc;
-use tokio::sync::{Mutex, RwLock, broadcast, oneshot};
+use tokio::sync::{RwLock, broadcast, oneshot};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
@@ -295,6 +295,9 @@ use crate::protocol::{
     LATEST_PROTOCOL_VERSION, McpNotification, PROTOCOL_VERSION_2026_07_28, RequestId,
 };
 use crate::router::{McpRouter, RouterRequest, RouterResponse};
+use crate::transport::pending::{
+    AbandonSender, Completion, PendingClientRequests, abandon_channel, cancelled_notification_json,
+};
 use crate::transport::service::{
     CatchError, InjectAnnotations, McpBoxService, ServiceFactory, identity_factory,
 };

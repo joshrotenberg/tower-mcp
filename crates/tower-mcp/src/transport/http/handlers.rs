@@ -1142,10 +1142,11 @@ pub(super) async fn handle_post(
                 ))
             };
 
-            if session.complete_pending_request(&id, result).await {
-                tracing::debug!(request_id = ?id, "Completed pending request");
-            } else {
-                tracing::warn!(request_id = ?id, "Received response for unknown request");
+            match session.complete_pending_request(&id, result) {
+                Completion::Delivered => {
+                    tracing::debug!(request_id = ?id, "Completed pending request");
+                }
+                undelivered => undelivered.log_undelivered(&id),
             }
         }
         return StatusCode::ACCEPTED.into_response();
@@ -1283,11 +1284,14 @@ pub(super) async fn handle_post(
                         let negotiated_version = session.protocol_version.read().await.clone();
                         return associated_request_sse_response(
                             session,
+                            state.stream_shutdown.clone(),
                             call,
                             request_rx,
                             outgoing,
-                            request_id,
-                            request_method,
+                            OriginatingRequest {
+                                id: request_id,
+                                method: request_method,
+                            },
                             negotiated_version,
                         );
                     }
@@ -1386,26 +1390,124 @@ pub(super) async fn handle_post(
 /// process and replaying them on another connection would break association.
 fn associated_request_sse_response(
     session: Arc<Session>,
-    mut call: AssociatedCall,
-    mut request_rx: OutgoingRequestReceiver,
+    stream_shutdown: CancellationToken,
+    call: AssociatedCall,
+    request_rx: OutgoingRequestReceiver,
     first_outgoing: OutgoingRequest,
-    original_request_id: RequestId,
-    request_method: String,
+    originating: OriginatingRequest,
     negotiated_version: String,
 ) -> Response {
     let (event_tx, event_rx) =
         tokio::sync::mpsc::channel::<std::result::Result<Event, Infallible>>(32);
-    let call_version = negotiated_version.clone();
+    let writer = AssociatedWriter {
+        session: session.clone(),
+        event_tx,
+        call,
+        request_rx,
+        originating,
+        call_version: negotiated_version.clone(),
+    };
 
     tokio::spawn(async move {
-        let mut pending_ids = Vec::new();
-        if !send_associated_request(&session, &event_tx, first_outgoing, &mut pending_ids).await {
-            session
-                .fail_pending_requests(
-                    &pending_ids,
-                    "originating POST disconnected before the client request was delivered",
-                )
-                .await;
+        // Releases this POST's registered client requests however the task
+        // ends, including when the writer is dropped while parked on a full
+        // SSE buffer.
+        let mut cleanup = PostCleanup {
+            session: session.clone(),
+            ids: Vec::new(),
+            reason: "originating POST ended",
+        };
+        // Session termination and server shutdown race the whole writer, so
+        // they win even while it waits for buffer space. Nothing will answer,
+        // and the POST must not outlive either; dropping the writer closes
+        // its SSE body.
+        let stopped = tokio::select! {
+            biased;
+            () = session.terminated.cancelled() => Some("session terminated"),
+            () = stream_shutdown.cancelled() => Some("server shutting down"),
+            () = writer.run(first_outgoing, &mut cleanup.ids) => None,
+        };
+        if let Some(reason) = stopped {
+            cleanup.reason = reason;
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(event_rx);
+    let mut response = Sse::new(stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(30))
+                .text("ping"),
+        )
+        .into_response();
+    response.headers_mut().insert(
+        MCP_PROTOCOL_VERSION_HEADER,
+        HeaderValue::from_str(&negotiated_version).unwrap(),
+    );
+    response
+}
+
+/// The client POST whose stream carries associated server-to-client requests.
+struct OriginatingRequest {
+    id: RequestId,
+    method: String,
+}
+
+/// Fails a POST's registered client requests when dropped. Requests the
+/// writer already resolved are no longer registered, so this only reaches
+/// those left behind when the writer was stopped or dropped.
+struct PostCleanup {
+    session: Arc<Session>,
+    ids: Vec<RequestId>,
+    reason: &'static str,
+}
+
+impl Drop for PostCleanup {
+    fn drop(&mut self) {
+        self.session.fail_pending_requests(&self.ids, self.reason);
+    }
+}
+
+/// Writes one POST's associated client requests, their cancellations, and
+/// its final response onto the POST's SSE stream.
+struct AssociatedWriter {
+    session: Arc<Session>,
+    event_tx: tokio::sync::mpsc::Sender<std::result::Result<Event, Infallible>>,
+    call: AssociatedCall,
+    request_rx: OutgoingRequestReceiver,
+    originating: OriginatingRequest,
+    call_version: String,
+}
+
+impl AssociatedWriter {
+    /// Run until the POST is answered or its stream is gone. Every id
+    /// registered is pushed onto `pending_ids`, so the caller can release
+    /// them if this future is dropped.
+    async fn run(self, first_outgoing: OutgoingRequest, pending_ids: &mut Vec<RequestId>) {
+        let AssociatedWriter {
+            session,
+            event_tx,
+            mut call,
+            mut request_rx,
+            originating:
+                OriginatingRequest {
+                    id: original_request_id,
+                    method: request_method,
+                },
+            call_version,
+        } = self;
+        let session = &session;
+        // Ids of this POST's client requests whose waiter gave up. They are
+        // cancelled on this POST's stream, the one that carried the request
+        // (#1705).
+        let (abandon_tx, mut abandon_rx) = abandon_channel();
+        if !send_associated_request(session, &event_tx, first_outgoing, &abandon_tx, pending_ids)
+            .await
+        {
+            session.fail_pending_requests(
+                pending_ids,
+                "originating POST disconnected before the client request was delivered",
+            );
             return;
         }
 
@@ -1413,21 +1515,33 @@ fn associated_request_sse_response(
         loop {
             tokio::select! {
                 _ = event_tx.closed() => {
-                    session
-                        .fail_pending_requests(
-                            &pending_ids,
-                            "originating POST response stream disconnected",
-                        )
-                        .await;
+                    // Nowhere left to send a cancellation.
+                    session.fail_pending_requests(
+                        pending_ids,
+                        "originating POST response stream disconnected",
+                    );
                     return;
                 }
                 result = &mut call => {
-                    session
-                        .fail_pending_requests(
-                            &pending_ids,
-                            "originating POST completed before the client request response arrived",
-                        )
-                        .await;
+                    // The handler finished. Under one registry lock, each
+                    // client request still pending is abandoned if its waiter
+                    // is gone, or failed if something (such as a task holding
+                    // a cloned context) still waits; never both. Then collect
+                    // what watchers already reported: they report under the
+                    // same lock, so every abandoned request is seen exactly
+                    // once, and each is cancelled before the final response.
+                    let mut abandoned = session.settle_pending_requests(
+                        pending_ids,
+                        "originating POST completed before the client request response arrived",
+                    );
+                    while let Ok(id) = abandon_rx.try_recv() {
+                        abandoned.push(id);
+                    }
+                    for id in &abandoned {
+                        if !send_associated_cancel(&event_tx, id).await {
+                            return;
+                        }
+                    }
 
                     let mut response = match result {
                         Ok(response) => response,
@@ -1465,48 +1579,43 @@ fn associated_request_sse_response(
                     match outgoing {
                         Some(outgoing) => {
                             if !send_associated_request(
-                                &session,
+                                session,
                                 &event_tx,
                                 outgoing,
-                                &mut pending_ids,
+                                &abandon_tx,
+                                pending_ids,
                             )
                             .await
                             {
-                                session
-                                    .fail_pending_requests(
-                                        &pending_ids,
-                                        "originating POST disconnected before the client request was delivered",
-                                    )
-                                    .await;
+                                session.fail_pending_requests(
+                                    pending_ids,
+                                    "originating POST disconnected before the client request was delivered",
+                                );
                                 return;
                             }
                         }
                         None => requests_open = false,
                     }
                 }
+                Some(id) = abandon_rx.recv() => {
+                    if !send_associated_cancel(&event_tx, &id).await {
+                        session.fail_pending_requests(
+                            pending_ids,
+                            "originating POST response stream disconnected",
+                        );
+                        return;
+                    }
+                }
             }
         }
-    });
-
-    let stream = tokio_stream::wrappers::ReceiverStream::new(event_rx);
-    let mut response = Sse::new(stream)
-        .keep_alive(
-            axum::response::sse::KeepAlive::new()
-                .interval(Duration::from_secs(30))
-                .text("ping"),
-        )
-        .into_response();
-    response.headers_mut().insert(
-        MCP_PROTOCOL_VERSION_HEADER,
-        HeaderValue::from_str(&negotiated_version).unwrap(),
-    );
-    response
+    }
 }
 
 async fn send_associated_request(
     session: &Session,
     event_tx: &tokio::sync::mpsc::Sender<std::result::Result<Event, Infallible>>,
     outgoing: OutgoingRequest,
+    abandon_tx: &AbandonSender,
     pending_ids: &mut Vec<RequestId>,
 ) -> bool {
     let id = outgoing.id.clone();
@@ -1526,11 +1635,27 @@ async fn send_associated_request(
         }
     };
 
-    session
-        .add_pending_request(id.clone(), outgoing.response_tx)
-        .await;
+    // A waiter that already gave up needs no request and no cancellation.
+    if !session.add_pending_request(id.clone(), outgoing.response_tx, abandon_tx.clone()) {
+        return true;
+    }
     pending_ids.push(id);
 
+    event_tx
+        .send(Ok(Event::default().event(SSE_MESSAGE_EVENT).data(data)))
+        .await
+        .is_ok()
+}
+
+/// Send `notifications/cancelled` for an abandoned client request on the
+/// originating POST's stream. Returns `false` if the stream is gone.
+async fn send_associated_cancel(
+    event_tx: &tokio::sync::mpsc::Sender<std::result::Result<Event, Infallible>>,
+    id: &RequestId,
+) -> bool {
+    let Some(data) = cancelled_notification_json(id) else {
+        return true;
+    };
     event_tx
         .send(Ok(Event::default().event(SSE_MESSAGE_EVENT).data(data)))
         .await

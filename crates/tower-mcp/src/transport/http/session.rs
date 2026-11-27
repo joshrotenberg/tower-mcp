@@ -11,11 +11,6 @@
 
 use super::*;
 
-/// Pending request waiting for a response from the client
-struct PendingRequest {
-    response_tx: oneshot::Sender<Result<serde_json::Value>>,
-}
-
 /// Session state for HTTP transport
 /// How a session produces its MCP service for request processing.
 pub(super) enum SessionServiceSource {
@@ -48,7 +43,11 @@ pub(super) struct Session {
     /// Last time this session was accessed
     last_accessed: RwLock<Instant>,
     /// Pending outgoing requests waiting for responses
-    pending_requests: Mutex<HashMap<RequestId, PendingRequest>>,
+    pending_requests: PendingClientRequests,
+    /// Cancelled when the session leaves the live map (DELETE, expiry, or
+    /// an aborted initialize), so request-scoped POST streams that are still
+    /// waiting on the client end and release their pending requests.
+    pub(super) terminated: CancellationToken,
     /// Session-wide allocator for request-scoped server-to-client request IDs.
     ///
     /// Each originating POST owns a separate channel, but IDs must remain
@@ -127,7 +126,8 @@ impl Session {
             notifications_tx,
             created_at: now,
             last_accessed: RwLock::new(now),
-            pending_requests: Mutex::new(HashMap::new()),
+            pending_requests: PendingClientRequests::new(),
+            terminated: CancellationToken::new(),
             request_id_allocator,
             protocol_version: RwLock::new(LATEST_PROTOCOL_VERSION.to_string()),
             client_info: RwLock::new(None),
@@ -157,7 +157,8 @@ impl Session {
             notifications_tx,
             created_at: now,
             last_accessed: RwLock::new(now),
-            pending_requests: Mutex::new(HashMap::new()),
+            pending_requests: PendingClientRequests::new(),
+            terminated: CancellationToken::new(),
             request_id_allocator: None,
             protocol_version: RwLock::new(LATEST_PROTOCOL_VERSION.to_string()),
             client_info: RwLock::new(None),
@@ -228,7 +229,8 @@ impl Session {
             notifications_tx,
             created_at: now,
             last_accessed: RwLock::new(now),
-            pending_requests: Mutex::new(HashMap::new()),
+            pending_requests: PendingClientRequests::new(),
+            terminated: CancellationToken::new(),
             request_id_allocator,
             protocol_version: RwLock::new(record.protocol_version.clone()),
             client_info: RwLock::new(record.client_info.clone()),
@@ -259,7 +261,8 @@ impl Session {
             notifications_tx,
             created_at: now,
             last_accessed: RwLock::new(now),
-            pending_requests: Mutex::new(HashMap::new()),
+            pending_requests: PendingClientRequests::new(),
+            terminated: CancellationToken::new(),
             request_id_allocator: None,
             protocol_version: RwLock::new(record.protocol_version.clone()),
             client_info: RwLock::new(record.client_info.clone()),
@@ -371,51 +374,51 @@ impl Session {
         self.last_accessed.read().await.elapsed() > ttl
     }
 
-    /// Store a pending request
-    pub(super) async fn add_pending_request(
+    /// Store a pending request.
+    ///
+    /// Returns `false` if the waiter already gave up, in which case the
+    /// request should not be written. If the waiter gives up later, the id
+    /// is reported on `on_abandon` so the originating POST stream can tell
+    /// the client (#1705).
+    pub(super) fn add_pending_request(
         &self,
         id: RequestId,
         response_tx: oneshot::Sender<Result<serde_json::Value>>,
-    ) {
-        let mut pending = self.pending_requests.lock().await;
-        pending.insert(id, PendingRequest { response_tx });
+        on_abandon: AbandonSender,
+    ) -> bool {
+        self.pending_requests.register(id, response_tx, on_abandon)
     }
 
     /// Complete a pending request with a response
-    pub(super) async fn complete_pending_request(
+    pub(super) fn complete_pending_request(
         &self,
         id: &RequestId,
         result: Result<serde_json::Value>,
-    ) -> bool {
-        let pending = {
-            let mut pending_requests = self.pending_requests.lock().await;
-            pending_requests.remove(id)
-        };
-
-        match pending {
-            Some(pending) => {
-                // Send result to waiter (ignore if they've dropped the receiver)
-                let _ = pending.response_tx.send(result);
-                true
-            }
-            None => false,
-        }
+    ) -> Completion {
+        self.pending_requests.complete(id, result)
     }
 
-    /// Fail request-scoped client requests whose originating POST is gone.
-    pub(super) async fn fail_pending_requests(&self, ids: &[RequestId], message: &str) {
-        let removed = {
-            let mut pending = self.pending_requests.lock().await;
-            ids.iter()
-                .filter_map(|id| pending.remove(id))
-                .collect::<Vec<_>>()
-        };
+    /// Fail request-scoped client requests whose originating POST can no
+    /// longer reach the client.
+    pub(super) fn fail_pending_requests(&self, ids: &[RequestId], message: &str) {
+        self.pending_requests.fail(ids, message);
+    }
 
-        for pending in removed {
-            let _ = pending
-                .response_tx
-                .send(Err(Error::Transport(message.to_string())));
-        }
+    /// Resolve request-scoped client requests whose originating POST
+    /// finished while its stream is still open. Returns the abandoned ids to
+    /// cancel on that stream; requests something still waits on are failed
+    /// instead, never both. See [`PendingClientRequests::settle`].
+    pub(super) fn settle_pending_requests(
+        &self,
+        ids: &[RequestId],
+        message: &str,
+    ) -> Vec<RequestId> {
+        self.pending_requests.settle(ids, message)
+    }
+
+    /// Mark the session terminated. Called whenever it leaves the live map.
+    fn terminate(&self) {
+        self.terminated.cancel();
     }
 }
 
@@ -917,8 +920,12 @@ impl SessionRegistry {
     pub(super) async fn remove(&self, id: &str) -> bool {
         let removed = {
             let mut sessions = self.sessions.write().await;
-            sessions.remove(id).is_some()
+            sessions.remove(id)
         };
+        if let Some(session) = &removed {
+            session.terminate();
+        }
+        let removed = removed.is_some();
         self.finish_removal(id, removed).await;
         removed
     }
@@ -940,6 +947,7 @@ impl SessionRegistry {
             let mut sessions = self.sessions.write().await;
             match sessions.get(id) {
                 Some(session) if principal.matches(&session.principal) => {
+                    session.terminate();
                     sessions.remove(id).is_some()
                 }
                 Some(_) => {
@@ -987,8 +995,9 @@ impl SessionRegistry {
             if sessions
                 .get(id)
                 .is_some_and(|s| principal.matches(&s.principal))
+                && let Some(session) = sessions.remove(id)
             {
-                sessions.remove(id);
+                session.terminate();
             }
         }
         self.finish_removal(id, true).await;
@@ -1043,7 +1052,9 @@ impl SessionRegistry {
             }
 
             for id in &expired {
-                sessions.remove(id);
+                if let Some(session) = sessions.remove(id) {
+                    session.terminate();
+                }
                 tracing::debug!(session_id = %id, "Expired session removed");
             }
 

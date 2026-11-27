@@ -8,6 +8,8 @@
 
 pub mod stdio;
 
+pub(crate) mod pending;
+
 #[cfg(feature = "stateless")]
 pub(crate) mod subscriptions;
 

@@ -7148,3 +7148,129 @@ async fn legacy_sse_get_parses_accept_media_ranges() {
     .await
     .expect("legacy SSE GET matrix timed out");
 }
+
+/// Server shutdown ends an associated POST that is still waiting on the
+/// client, so the unbounded drain completes (#1705). The listener is bound
+/// before it is handed to the transport, so no other process can take the
+/// port in between. Binds a local socket.
+#[tokio::test]
+async fn shutdown_ends_a_post_waiting_on_the_client() {
+    use crate::extract::{Context, RawArgs};
+    use crate::protocol::{ElicitFormParams, ElicitFormSchema};
+
+    let confirm = crate::ToolBuilder::new("confirm")
+        .description("Ask the user to confirm")
+        .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
+            let result = ctx
+                .elicit_form(ElicitFormParams {
+                    mode: None,
+                    message: "Continue?".into(),
+                    requested_schema: ElicitFormSchema::new(),
+                    meta: None,
+                })
+                .await;
+            Ok(match result {
+                Ok(_) => crate::CallToolResult::text("answered"),
+                Err(error) => crate::CallToolResult::error(error.to_string()),
+            })
+        })
+        .build();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut stop_tx = Some(stop_tx);
+    let server = tokio::spawn(
+        HttpTransport::new(McpRouter::new().tool(confirm))
+            .with_sampling()
+            .serve_on_listener(
+                listener,
+                async move {
+                    let _ = stop_rx.await;
+                },
+                None,
+            ),
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let client = reqwest::Client::new();
+        let post = |body: serde_json::Value, session: Option<&str>| {
+            let mut request = client
+                .post(&url)
+                .header("accept", "application/json, text/event-stream")
+                .json(&body);
+            if let Some(session) = session {
+                request = request.header("mcp-session-id", session);
+            }
+            request.send()
+        };
+        let initialized = post(
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {"elicitation": {}},
+                    "clientInfo": {"name": "shutdown-test", "version": "0"}
+                }
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        let session = initialized.headers()["mcp-session-id"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        post(
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            Some(&session),
+        )
+        .await
+        .unwrap();
+        let waiting = post(
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "confirm", "arguments": {}}
+            }),
+            Some(&session),
+        )
+        .await
+        .unwrap();
+
+        // Collect the POST's SSE frames; stop once the elicitation arrives
+        // the first time, then read to the end after shutdown.
+        let mut body = waiting.bytes_stream();
+        let mut buffer = String::new();
+        let mut frames: Vec<serde_json::Value> = Vec::new();
+        let mut stopped = false;
+        while let Some(chunk) = body.next().await {
+            buffer.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+            while let Some(end) = buffer.find("\n\n") {
+                let event: String = buffer.drain(..end + 2).collect();
+                if let Some(data) = event.lines().find_map(|l| l.strip_prefix("data:")) {
+                    frames.push(serde_json::from_str(data.trim_start()).unwrap());
+                }
+            }
+            if !stopped && frames.iter().any(|f| f["method"] == "elicitation/create") {
+                stop_tx.take().unwrap().send(()).unwrap();
+                stopped = true;
+            }
+        }
+
+        assert!(stopped, "the elicitation was written: {frames:#?}");
+        assert!(
+            !frames
+                .iter()
+                .any(|f| f["id"] == 2 && f.get("method").is_none()),
+            "the POST ends without an answer: {frames:#?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| f["method"] == "notifications/cancelled"),
+            "{frames:#?}"
+        );
+        server.await.unwrap().unwrap();
+    })
+    .await
+    .expect("the waiting POST must not hold the drain open");
+}
