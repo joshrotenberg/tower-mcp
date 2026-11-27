@@ -747,6 +747,27 @@ impl McpRouter {
         }
     }
 
+    /// A clone whose in-flight request registry is its own.
+    ///
+    /// The registry is otherwise shared by every clone and every
+    /// [`with_fresh_session`](Self::with_fresh_session), so a
+    /// `notifications/cancelled` routed through one clone reaches a request
+    /// with the same id dispatched through another. A transport that owns a
+    /// single connection calls this once, before it wraps the router, so the
+    /// requests it dispatches and the cancellations it routes share one
+    /// registry that no other connection sees (#1710). Everything else,
+    /// including session state, is shared exactly as with `clone`.
+    pub(crate) fn with_own_in_flight(mut self) -> Self {
+        Arc::make_mut(&mut self.inner).in_flight = Arc::new(RwLock::new(HashMap::new()));
+        self
+    }
+
+    /// The session's lifecycle phase.
+    #[cfg(test)]
+    pub(crate) fn session_phase(&self) -> crate::session::SessionPhase {
+        self.session.phase()
+    }
+
     /// Build a map of tool names to their annotations.
     ///
     /// The returned [`ToolAnnotationsMap`] includes annotations from all

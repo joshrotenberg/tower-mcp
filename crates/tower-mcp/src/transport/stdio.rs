@@ -479,13 +479,7 @@ impl StdioSubscriptions {
         let method = parsed.get("method").and_then(serde_json::Value::as_str);
 
         if method == Some(notifications::CANCELLED) && parsed.get("id").is_none() {
-            let notification: JsonRpcNotification = match serde_json::from_value(parsed.clone()) {
-                Ok(notification) => notification,
-                Err(_) => return Ok(StdioSubscriptionInput::NotHandled),
-            };
-            let Ok(McpNotification::Cancelled(params)) =
-                McpNotification::from_jsonrpc(&notification)
-            else {
+            let Some(McpNotification::Cancelled(params)) = parse_notification_frame(parsed) else {
                 return Ok(StdioSubscriptionInput::NotHandled);
             };
             if let Some(request_id) = params.request_id
@@ -894,6 +888,19 @@ fn handle_notification(router: &McpRouter, notification: JsonRpcNotification) ->
     let mcp_notification = McpNotification::from_jsonrpc(&notification)?;
     router.handle_notification(mcp_notification);
     Ok(())
+}
+
+/// Parse a client notification frame: the JSON-RPC envelope, then the MCP
+/// notification its method names.
+///
+/// `None` when the frame is not a [`JsonRpcNotification`] (for example it
+/// lacks the `jsonrpc` marker) or its params do not fit its method. The
+/// listen-stream registry and the channel transport's router forward both
+/// use this, so they agree on which frames are a `notifications/cancelled`
+/// (#1710).
+pub(crate) fn parse_notification_frame(frame: &serde_json::Value) -> Option<McpNotification> {
+    let notification = <JsonRpcNotification as serde::Deserialize>::deserialize(frame).ok()?;
+    McpNotification::from_jsonrpc(&notification).ok()
 }
 
 /// Serialize a server notification to a JSON-RPC notification string.
