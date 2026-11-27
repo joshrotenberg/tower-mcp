@@ -1268,3 +1268,575 @@ mod panics {
         assert_eq!(after.all_text(), "ok");
     }
 }
+
+/// #1710: a client's `notifications/cancelled` reaches the router on the
+/// in-process transport, and stays separate from listen-stream cancellation.
+///
+/// Driven at the frame level through [`ClientTransport`] so the client's own
+/// cancellation bookkeeping is out of the picture. Every wait is bounded, and
+/// ordering is established by round trips rather than sleeps: the transport
+/// handles a notification inline before it reads the next frame, so once a
+/// later request is answered, an earlier notification has been handled.
+mod client_cancellation {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::{Notify, mpsc};
+    use tokio::time::timeout;
+    use tower_mcp::client::{ChannelTransport, ClientTransport};
+    use tower_mcp::extract::{Context, RawArgs, State};
+    use tower_mcp::{CallToolResult, McpRouter, ToolBuilder};
+
+    const STEP: Duration = Duration::from_secs(5);
+
+    /// How a `gate` call ended.
+    #[derive(Debug, PartialEq)]
+    enum Outcome {
+        Cancelled,
+        Released,
+    }
+
+    /// Shared with the `gate` tool: it reports that it started, then waits
+    /// for either its cancellation or a release, and reports which came.
+    #[derive(Clone)]
+    struct Gate {
+        started: mpsc::UnboundedSender<()>,
+        outcome: mpsc::UnboundedSender<Outcome>,
+        release: Arc<Notify>,
+    }
+
+    struct GateProbe {
+        started: mpsc::UnboundedReceiver<()>,
+        outcome: mpsc::UnboundedReceiver<Outcome>,
+        release: Arc<Notify>,
+    }
+
+    impl GateProbe {
+        async fn started(&mut self) {
+            timeout(STEP, self.started.recv())
+                .await
+                .expect("the gate handler never started")
+                .expect("gate dropped");
+        }
+
+        async fn outcome(&mut self) -> Outcome {
+            timeout(STEP, self.outcome.recv())
+                .await
+                .expect("the gate handler never finished")
+                .expect("gate dropped")
+        }
+    }
+
+    fn router() -> (McpRouter, GateProbe) {
+        let (started_tx, started_rx) = mpsc::unbounded_channel();
+        let (outcome_tx, outcome_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let gate = Gate {
+            started: started_tx,
+            outcome: outcome_tx,
+            release: release.clone(),
+        };
+        let gate_tool = ToolBuilder::new("gate")
+            .description("Waits for cancellation or release")
+            .extractor_handler(
+                gate,
+                |State(gate): State<Gate>, ctx: Context, RawArgs(_): RawArgs| async move {
+                    let _ = gate.started.send(());
+                    let outcome = tokio::select! {
+                        () = ctx.cancelled() => Outcome::Cancelled,
+                        () = gate.release.notified() => Outcome::Released,
+                    };
+                    let _ = gate.outcome.send(outcome);
+                    Ok(CallToolResult::text("gate done"))
+                },
+            )
+            .build();
+        let echo = ToolBuilder::new("echo")
+            .description("Answers immediately")
+            .extractor_handler((), |RawArgs(_): RawArgs| async move {
+                Ok(CallToolResult::text("echoed"))
+            })
+            .build();
+        let router = McpRouter::new()
+            .server_info("channel-cancel-test", "0.0.0")
+            .tool(gate_tool)
+            .tool(echo);
+        (
+            router,
+            GateProbe {
+                started: started_rx,
+                outcome: outcome_rx,
+                release,
+            },
+        )
+    }
+
+    /// A raw frame client over a [`ChannelTransport`].
+    struct Wire(ChannelTransport);
+
+    impl Wire {
+        async fn send(&mut self, frame: serde_json::Value) {
+            self.0.send(&frame.to_string()).await.expect("send frame");
+        }
+
+        async fn next_frame(&mut self) -> serde_json::Value {
+            let raw = timeout(STEP, self.0.recv())
+                .await
+                .expect("no frame arrived in time")
+                .expect("recv")
+                .expect("transport closed");
+            serde_json::from_str(&raw).expect("a JSON frame")
+        }
+
+        /// Collect frames until the response for `id` arrives.
+        async fn frames_until_response(&mut self, id: serde_json::Value) -> Vec<serde_json::Value> {
+            let mut seen = Vec::new();
+            loop {
+                let frame = self.next_frame().await;
+                let done = frame.get("method").is_none() && frame["id"] == id;
+                seen.push(frame);
+                if done {
+                    return seen;
+                }
+            }
+        }
+
+        /// Complete a 2025-11-25 handshake.
+        async fn initialize(&mut self) {
+            self.send(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "t", "version": "0"}
+                }
+            }))
+            .await;
+            let init = self.frames_until_response(serde_json::json!(1)).await;
+            assert!(init.last().unwrap().get("result").is_some(), "{init:?}");
+            self.send(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            }))
+            .await;
+        }
+
+        async fn call(&mut self, id: serde_json::Value, tool: &str) {
+            self.send(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": {}}
+            }))
+            .await;
+        }
+
+        async fn cancel(&mut self, id: serde_json::Value) {
+            self.send(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": id, "reason": "test"}
+            }))
+            .await;
+        }
+
+        /// A cancellation that claims JSON-RPC 1.0, which is ignored.
+        async fn cancel_jsonrpc_1_0(&mut self, id: serde_json::Value) {
+            self.send(serde_json::json!({
+                "jsonrpc": "1.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": id, "reason": "test"}
+            }))
+            .await;
+        }
+
+        /// A cancellation without the `jsonrpc` marker, which is not a
+        /// JSON-RPC notification and is ignored.
+        async fn cancel_markerless(&mut self, id: serde_json::Value) {
+            self.send(serde_json::json!({
+                "method": "notifications/cancelled",
+                "params": {"requestId": id, "reason": "test"}
+            }))
+            .await;
+        }
+
+        /// Close the transport and read every remaining frame, asserting
+        /// none answers `id`.
+        ///
+        /// The stream ends only once every task that could still write to it
+        /// has finished, including spawned request tasks, so a late response
+        /// cannot slip past this the way it could past a later round trip.
+        async fn assert_unanswered_through_eof(&mut self, id: serde_json::Value, shape: &str) {
+            self.0.close().await.expect("close");
+            let rest = timeout(STEP, async {
+                let mut rest = Vec::new();
+                while let Some(raw) = self.0.recv().await.expect("recv") {
+                    let frame: serde_json::Value =
+                        serde_json::from_str(&raw).expect("a JSON frame");
+                    rest.push(frame);
+                }
+                rest
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{shape}: the transport never reached EOF"));
+            assert!(
+                rest.iter()
+                    .all(|frame| frame.get("method").is_some() || frame["id"] != id),
+                "{shape}: request {id} was answered: {rest:?}"
+            );
+        }
+    }
+
+    fn plain(router: McpRouter) -> Wire {
+        Wire(ChannelTransport::new(router))
+    }
+
+    fn layered(router: McpRouter) -> Wire {
+        Wire(ChannelTransport::layer(
+            router,
+            tower::timeout::TimeoutLayer::new(Duration::from_secs(60)),
+        ))
+    }
+
+    /// The handler of a request the client cancels observes the
+    /// cancellation, and the request is left unanswered (#1547). Holds with
+    /// and without a layer, since the layered service and the reader share
+    /// the channel's in-flight registry.
+    #[tokio::test]
+    async fn a_client_cancellation_reaches_the_handler() {
+        for (shape, build) in [
+            ("plain", plain as fn(McpRouter) -> Wire),
+            ("layered", layered),
+        ] {
+            let (router, mut probe) = router();
+            let mut wire = build(router);
+            wire.initialize().await;
+
+            wire.call(serde_json::json!(7), "gate").await;
+            probe.started().await;
+            wire.cancel(serde_json::json!(7)).await;
+            assert_eq!(probe.outcome().await, Outcome::Cancelled, "{shape}");
+
+            // The transport still serves other requests.
+            wire.call(serde_json::json!(8), "echo").await;
+            let seen = wire.frames_until_response(serde_json::json!(8)).await;
+            assert_eq!(
+                seen.last().unwrap()["result"]["content"][0]["text"],
+                "echoed",
+                "{shape}"
+            );
+            assert!(
+                seen.iter().all(|frame| frame["id"] != 7),
+                "{shape}: a cancelled request was answered: {seen:?}"
+            );
+            wire.assert_unanswered_through_eof(serde_json::json!(7), shape)
+                .await;
+        }
+    }
+
+    /// Two channels built from one router keep separate in-flight
+    /// registries: cancelling request 7 on one leaves request 7 on the other
+    /// running, and only the cancelled one goes unanswered.
+    #[tokio::test]
+    async fn channels_from_one_router_do_not_cancel_each_other() {
+        let (router, mut probe) = router();
+        let mut first = plain(router.with_fresh_session());
+        let mut second = plain(router.with_fresh_session());
+        first.initialize().await;
+        second.initialize().await;
+
+        first.call(serde_json::json!(7), "gate").await;
+        probe.started().await;
+        second.call(serde_json::json!(7), "gate").await;
+        probe.started().await;
+
+        first.cancel(serde_json::json!(7)).await;
+        assert_eq!(probe.outcome().await, Outcome::Cancelled);
+
+        // Had the cancellation reached both, the second outcome would already
+        // be `Cancelled`. Releasing the gate can only end the survivor.
+        probe.release.notify_one();
+        assert_eq!(probe.outcome().await, Outcome::Released);
+        let seen = second.frames_until_response(serde_json::json!(7)).await;
+        assert_eq!(
+            seen.last().unwrap()["result"]["content"][0]["text"],
+            "gate done"
+        );
+
+        first
+            .assert_unanswered_through_eof(serde_json::json!(7), "first")
+            .await;
+    }
+
+    /// A cancellation without the `jsonrpc` marker is not a JSON-RPC
+    /// notification. It was ignored before #1710 and still is: the request
+    /// runs to completion and is answered.
+    #[tokio::test]
+    async fn a_markerless_cancellation_is_ignored() {
+        let (router, mut probe) = router();
+        let mut wire = plain(router);
+        wire.initialize().await;
+
+        wire.call(serde_json::json!(7), "gate").await;
+        probe.started().await;
+        wire.cancel_markerless(serde_json::json!(7)).await;
+
+        // Handled before this request is read, so the release cannot race it.
+        wire.call(serde_json::json!(8), "echo").await;
+        wire.frames_until_response(serde_json::json!(8)).await;
+
+        probe.release.notify_one();
+        assert_eq!(probe.outcome().await, Outcome::Released);
+        let seen = wire.frames_until_response(serde_json::json!(7)).await;
+        assert_eq!(
+            seen.last().unwrap()["result"]["content"][0]["text"],
+            "gate done"
+        );
+    }
+
+    /// A cancellation naming an id that is not in flight changes nothing:
+    /// the running request still completes normally, and a later request
+    /// under that id is answered.
+    #[tokio::test]
+    async fn a_cancellation_for_an_unknown_id_is_ignored() {
+        let (router, mut probe) = router();
+        let mut wire = plain(router);
+        wire.initialize().await;
+
+        wire.call(serde_json::json!(7), "gate").await;
+        probe.started().await;
+        wire.cancel(serde_json::json!(99)).await;
+
+        // Once this answer arrives the cancellation above has been handled,
+        // so releasing the gate afterwards cannot race it.
+        wire.call(serde_json::json!(8), "echo").await;
+        wire.frames_until_response(serde_json::json!(8)).await;
+
+        probe.release.notify_one();
+        assert_eq!(probe.outcome().await, Outcome::Released);
+        let seen = wire.frames_until_response(serde_json::json!(7)).await;
+        assert_eq!(
+            seen.last().unwrap()["result"]["content"][0]["text"],
+            "gate done"
+        );
+
+        wire.call(serde_json::json!(99), "echo").await;
+        let seen = wire.frames_until_response(serde_json::json!(99)).await;
+        assert_eq!(
+            seen.last().unwrap()["result"]["content"][0]["text"],
+            "echoed"
+        );
+    }
+
+    /// A cancellation whose `jsonrpc` is "1.0" is not acted on: the request
+    /// runs to completion and its reply is sent.
+    #[tokio::test]
+    async fn a_jsonrpc_1_0_cancellation_does_not_suppress_the_reply() {
+        let (router, mut probe) = router();
+        let mut wire = plain(router);
+        wire.initialize().await;
+
+        wire.call(serde_json::json!(7), "gate").await;
+        probe.started().await;
+        wire.cancel_jsonrpc_1_0(serde_json::json!(7)).await;
+
+        // Handled before this request is read, so the release cannot race it.
+        wire.call(serde_json::json!(8), "echo").await;
+        wire.frames_until_response(serde_json::json!(8)).await;
+
+        probe.release.notify_one();
+        assert_eq!(probe.outcome().await, Outcome::Released);
+        let seen = wire.frames_until_response(serde_json::json!(7)).await;
+        assert_eq!(
+            seen.last().unwrap()["result"]["content"][0]["text"],
+            "gate done"
+        );
+    }
+
+    #[cfg(feature = "stateless")]
+    mod subscriptions {
+        use std::sync::Mutex;
+
+        use super::*;
+        use tower_mcp::{
+            RequestId, SubscriptionClose, SubscriptionCloseReason, SubscriptionObserver,
+        };
+
+        #[derive(Default)]
+        struct RecordingObserver {
+            closes: Mutex<Vec<SubscriptionClose>>,
+        }
+
+        impl SubscriptionObserver for RecordingObserver {
+            fn on_close(&self, close: SubscriptionClose) {
+                self.closes.lock().unwrap().push(close);
+            }
+        }
+
+        impl RecordingObserver {
+            fn closes(&self) -> Vec<(RequestId, SubscriptionCloseReason)> {
+                self.closes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|close| (close.subscription_id.clone(), close.reason))
+                    .collect()
+            }
+        }
+
+        fn final_meta() -> serde_json::Value {
+            serde_json::json!({
+                "io.modelcontextprotocol/protocolVersion":
+                    tower_mcp::protocol::PROTOCOL_VERSION_2026_07_28,
+                "io.modelcontextprotocol/clientInfo": {"name": "t", "version": "0"},
+                "io.modelcontextprotocol/clientCapabilities": {}
+            })
+        }
+
+        /// Open a listen stream under `id` and wait for its acknowledgment.
+        async fn listen(wire: &mut Wire, id: &str) {
+            wire.send(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "subscriptions/listen",
+                "params": {
+                    "_meta": final_meta(),
+                    "notifications": {"toolsListChanged": true}
+                }
+            }))
+            .await;
+            let ack = wire.next_frame().await;
+            assert_eq!(
+                ack["method"], "notifications/subscriptions/acknowledged",
+                "{ack}"
+            );
+            assert_eq!(
+                ack["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+                id
+            );
+        }
+
+        async fn final_call(wire: &mut Wire, id: &str, tool: &str) {
+            wire.send(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": {}, "_meta": final_meta()}
+            }))
+            .await;
+        }
+
+        fn observed() -> (Wire, GateProbe, Arc<RecordingObserver>) {
+            let observer = Arc::new(RecordingObserver::default());
+            let (router, probe) = router();
+            let router = router.with_subscription_observer(observer.clone());
+            (plain(router), probe, observer)
+        }
+
+        /// A cancellation naming a listen stream still closes that stream,
+        /// silently, now that cancellations also go to the router.
+        #[tokio::test]
+        async fn a_subscription_still_cancels() {
+            let (mut wire, _probe, observer) = observed();
+            listen(&mut wire, "sub").await;
+
+            wire.cancel(serde_json::json!("sub")).await;
+            // Handled before this request is read.
+            final_call(&mut wire, "after", "echo").await;
+            let seen = wire.frames_until_response(serde_json::json!("after")).await;
+            assert_eq!(
+                seen.len(),
+                1,
+                "cancelling a stream writes nothing: {seen:?}"
+            );
+
+            assert_eq!(
+                observer.closes(),
+                vec![(
+                    RequestId::String("sub".to_string()),
+                    SubscriptionCloseReason::Cancelled
+                )]
+            );
+        }
+
+        /// A request that reuses an active stream's id is cancelled along
+        /// with the stream: the stream does not consume the cancellation.
+        #[tokio::test]
+        async fn a_stream_does_not_consume_a_request_cancellation() {
+            let (mut wire, mut probe, observer) = observed();
+            listen(&mut wire, "shared").await;
+
+            final_call(&mut wire, "shared", "gate").await;
+            probe.started().await;
+            wire.cancel(serde_json::json!("shared")).await;
+
+            assert_eq!(probe.outcome().await, Outcome::Cancelled);
+            assert_eq!(
+                observer.closes(),
+                vec![(
+                    RequestId::String("shared".to_string()),
+                    SubscriptionCloseReason::Cancelled
+                )]
+            );
+        }
+
+        /// A "1.0" cancellation for an id shared by a stream and a request
+        /// reaches neither: the stream stays open and the request is
+        /// answered.
+        #[tokio::test]
+        async fn a_jsonrpc_1_0_cancellation_reaches_neither_path() {
+            let (mut wire, mut probe, observer) = observed();
+            listen(&mut wire, "shared").await;
+
+            final_call(&mut wire, "shared", "gate").await;
+            probe.started().await;
+            wire.cancel_jsonrpc_1_0(serde_json::json!("shared")).await;
+
+            // Handled before this request is read.
+            final_call(&mut wire, "after", "echo").await;
+            wire.frames_until_response(serde_json::json!("after")).await;
+            assert!(observer.closes().is_empty(), "{:?}", observer.closes());
+
+            probe.release.notify_one();
+            assert_eq!(probe.outcome().await, Outcome::Released);
+            let seen = wire
+                .frames_until_response(serde_json::json!("shared"))
+                .await;
+            assert_eq!(
+                seen.last().unwrap()["result"]["content"][0]["text"],
+                "gate done"
+            );
+        }
+
+        /// Both cancellation paths parse the envelope the same way. A
+        /// markerless cancellation for an id shared by a stream and a request
+        /// reaches neither, rather than cancelling the request and leaving
+        /// the stream open.
+        #[tokio::test]
+        async fn a_markerless_cancellation_reaches_neither_path() {
+            let (mut wire, mut probe, observer) = observed();
+            listen(&mut wire, "shared").await;
+
+            final_call(&mut wire, "shared", "gate").await;
+            probe.started().await;
+            wire.cancel_markerless(serde_json::json!("shared")).await;
+
+            // Handled before this request is read.
+            final_call(&mut wire, "after", "echo").await;
+            wire.frames_until_response(serde_json::json!("after")).await;
+            assert!(observer.closes().is_empty(), "{:?}", observer.closes());
+
+            probe.release.notify_one();
+            assert_eq!(probe.outcome().await, Outcome::Released);
+            let seen = wire
+                .frames_until_response(serde_json::json!("shared"))
+                .await;
+            assert_eq!(
+                seen.last().unwrap()["result"]["content"][0]["text"],
+                "gate done"
+            );
+        }
+    }
+}

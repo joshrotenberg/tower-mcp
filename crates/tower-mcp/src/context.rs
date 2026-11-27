@@ -1037,10 +1037,7 @@ impl RequestContext {
     /// registers the request, just before writing it: a request whose waiter
     /// is already gone by then is not sent. One whose waiter goes away while
     /// the write is in progress (for example while the transport waits for
-    /// buffer space) is still sent, and then cancelled. One transport
-    /// limitation applies:
-    /// [`ChannelTransport`](crate::client::ChannelTransport) does not deliver
-    /// a client's `notifications/cancelled` to the handler.
+    /// buffer space) is still sent, and then cancelled.
     ///
     pub async fn sample(&self, params: CreateMessageParams) -> Result<CreateMessageResult> {
         let requester = self.client_requester.as_ref().ok_or_else(|| {

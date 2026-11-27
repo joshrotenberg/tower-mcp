@@ -985,7 +985,7 @@ async fn handle_socket_bidirectional<S, R, E>(
         .router
         .clone()
         .with_client_requester(client_requester)
-        .with_connection_in_flight();
+        .with_own_in_flight();
     let service = JsonRpcService::new((session.service_factory)(router.clone()))
         .with_extensions(mcp_extensions)
         .protocol_support(protocol_support)
@@ -1734,7 +1734,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_before_dispatch_omits_only_the_named_batch_member() {
-        let router = create_test_router().with_connection_in_flight();
+        let router = create_test_router().with_own_in_flight();
         let connection = CancellationToken::new();
         let support = ProtocolSupport::try_new(["2025-03-26"]).unwrap();
         let service =
