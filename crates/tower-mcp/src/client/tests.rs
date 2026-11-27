@@ -4442,6 +4442,7 @@ async fn input_required_delivers_every_sep1330_enum_shape_to_the_handler() {
             "content": [{"type": "text", "text": "chosen"}]
         }),
     ]);
+    let outgoing = transport.outgoing.clone();
     let handler = RecordingElicitHandler::default();
     let seen = handler.seen.clone();
     let client = McpClient::builder()
@@ -4461,6 +4462,608 @@ async fn input_required_delivers_every_sep1330_enum_shape_to_the_handler() {
     .unwrap();
     assert_eq!(result.all_text(), "chosen");
     assert_sep1330_form_intact(&seen.lock().unwrap());
+    let frames = outbound_tool_calls(&outgoing);
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[1]["params"]["requestState"], "opaque");
+    assert_eq!(
+        frames[1]["params"]["inputResponses"],
+        serde_json::json!({"choose": {"action": "accept"}})
+    );
+}
+
+#[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
+mod input_resolution {
+    use super::*;
+    use crate::protocol::{ElicitAction, ElicitRequestParams, ElicitResult, TaskStatus};
+    use serde_json::{Value, json};
+    use std::future::Future;
+
+    struct FrameTransport {
+        incoming: mpsc::UnboundedReceiver<String>,
+        outgoing: Option<mpsc::UnboundedSender<Value>>,
+    }
+
+    #[async_trait]
+    impl ClientTransport for FrameTransport {
+        async fn send(&mut self, message: &str) -> Result<()> {
+            self.outgoing
+                .as_ref()
+                .expect("transport is open")
+                .send(serde_json::from_str(message).expect("valid outgoing JSON"))
+                .expect("peer is open");
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> Result<Option<String>> {
+            Ok(self.incoming.recv().await)
+        }
+
+        fn is_connected(&self) -> bool {
+            self.outgoing.is_some()
+        }
+
+        async fn close(&mut self) -> Result<()> {
+            self.outgoing.take();
+            Ok(())
+        }
+    }
+
+    struct Peer {
+        incoming: Option<mpsc::UnboundedSender<String>>,
+        outgoing: mpsc::UnboundedReceiver<Value>,
+    }
+
+    async fn within<T>(future: impl Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), future)
+            .await
+            .expect("timed out waiting for input resolution")
+    }
+
+    impl Peer {
+        async fn request(&mut self, method: &str) -> Value {
+            let frame = within(self.outgoing.recv())
+                .await
+                .expect("expected a frame");
+            assert_eq!(frame["method"], method, "{frame}");
+            assert!(frame["id"].is_number(), "{frame}");
+            frame
+        }
+
+        fn send(&self, frame: Value) {
+            self.incoming
+                .as_ref()
+                .unwrap()
+                .send(frame.to_string())
+                .unwrap();
+        }
+
+        fn respond(&self, request: &Value, result: Value) {
+            self.send(json!({"jsonrpc": "2.0", "id": request["id"], "result": result}));
+        }
+
+        async fn discover(&mut self, client: &McpClient) {
+            let (result, ()) =
+                tokio::join!(within(client.discover("test-client", "1.0.0")), async {
+                    let discover = self.request("server/discover").await;
+                    self.respond(&discover, final_discover_result());
+                },);
+            result.unwrap();
+        }
+
+        async fn list_tools(&mut self, client: &McpClient) {
+            let (result, ()) = tokio::join!(within(client.list_tools()), async {
+                let list = self.request("tools/list").await;
+                self.respond(&list, json!({"resultType": "complete", "tools": []}));
+            });
+            result.unwrap();
+        }
+
+        fn assert_idle(&mut self) {
+            assert!(matches!(
+                self.outgoing.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    async fn connect(handler: impl ClientHandler) -> (McpClient, Peer) {
+        let (incoming_tx, incoming) = mpsc::unbounded_channel();
+        let (outgoing, outgoing_rx) = mpsc::unbounded_channel();
+        let transport = FrameTransport {
+            incoming,
+            outgoing: Some(outgoing),
+        };
+        let client = McpClient::builder()
+            .protocol_support(ProtocolSupport::try_new(["2026-07-28"]).unwrap())
+            .disable_response_cache()
+            .with_elicitation()
+            .with_tasks()
+            .connect(transport, handler)
+            .await
+            .unwrap();
+        let mut peer = Peer {
+            incoming: Some(incoming_tx),
+            outgoing: outgoing_rx,
+        };
+        peer.discover(&client).await;
+        (client, peer)
+    }
+
+    fn input_requests(keys: impl IntoIterator<Item = impl Into<String>>) -> Value {
+        Value::Object(
+            keys.into_iter()
+                .map(|key| {
+                    let key = key.into();
+                    let request = json!({
+                        "method": "elicitation/create",
+                        "params": {"mode": "url", "message": key, "url": "https://example.com"}
+                    });
+                    (key, request)
+                })
+                .collect(),
+        )
+    }
+
+    fn input_required(keys: impl IntoIterator<Item = impl Into<String>>) -> Value {
+        json!({
+            "resultType": "input_required",
+            "inputRequests": input_requests(keys),
+            "requestState": "opaque state"
+        })
+    }
+
+    fn task_result(status: &str) -> Value {
+        json!({
+            "resultType": "complete",
+            "taskId": "task-1",
+            "status": status,
+            "createdAt": "2026-07-28T00:00:00Z",
+            "lastUpdatedAt": "2026-07-28T00:00:01Z",
+            "ttlMs": null
+        })
+    }
+
+    fn accept() -> ElicitResult {
+        ElicitResult {
+            action: ElicitAction::Accept,
+            content: None,
+            meta: None,
+        }
+    }
+
+    fn start_tool(client: &Arc<McpClient>) -> JoinHandle<Result<CallToolResult>> {
+        let client = Arc::clone(client);
+        tokio::spawn(async move { client.call_tool("work", json!({})).await })
+    }
+
+    async fn finish_tool(peer: &mut Peer, expected: Value) {
+        let retry = peer.request("tools/call").await;
+        assert_eq!(retry["params"]["requestState"], "opaque state");
+        assert_eq!(retry["params"]["inputResponses"], expected);
+        peer.respond(&retry, json!({"resultType": "complete", "content": []}));
+    }
+
+    struct PendingElicitation {
+        key: String,
+        answer: oneshot::Sender<std::result::Result<ElicitResult, JsonRpcError>>,
+        token: CancellationToken,
+        finished: oneshot::Receiver<()>,
+    }
+
+    impl PendingElicitation {
+        async fn assert_cancelled(self) {
+            within(self.token.cancelled()).await;
+            assert!(
+                within(self.finished).await.is_err(),
+                "handler must be dropped"
+            );
+            assert!(
+                self.answer.send(Ok(accept())).is_err(),
+                "late answer must be refused"
+            );
+        }
+    }
+
+    struct GatedHandler {
+        started: mpsc::UnboundedSender<PendingElicitation>,
+        notifications: mpsc::UnboundedSender<ServerNotification>,
+    }
+
+    #[async_trait]
+    impl ClientHandler for GatedHandler {
+        async fn handle_elicit(
+            &self,
+            params: ElicitRequestParams,
+        ) -> std::result::Result<ElicitResult, JsonRpcError> {
+            let ElicitRequestParams::FinalUrl(params) = params else {
+                panic!("expected final URL elicitation");
+            };
+            assert!(self.current_request_id().is_none());
+            let token = self.current_cancellation_token().expect("round token");
+            let (answer, wait_for_answer) = oneshot::channel();
+            let (finish, finished) = oneshot::channel();
+            assert!(
+                self.started
+                    .send(PendingElicitation {
+                        key: params.message,
+                        answer,
+                        token,
+                        finished,
+                    })
+                    .is_ok()
+            );
+
+            let result = wait_for_answer.await;
+            let _ = finish.send(());
+            result.unwrap_or_else(|_| Err(JsonRpcError::internal_error("test dropped its answer")))
+        }
+
+        async fn on_notification(&self, notification: ServerNotification) {
+            self.notifications.send(notification).unwrap();
+        }
+    }
+
+    struct Host {
+        started: mpsc::UnboundedReceiver<PendingElicitation>,
+        notifications: mpsc::UnboundedReceiver<ServerNotification>,
+    }
+
+    impl Host {
+        async fn connect() -> (Arc<McpClient>, Peer, Self) {
+            let (started_tx, started) = mpsc::unbounded_channel();
+            let (notifications_tx, notifications) = mpsc::unbounded_channel();
+            let (client, peer) = connect(GatedHandler {
+                started: started_tx,
+                notifications: notifications_tx,
+            })
+            .await;
+            (
+                Arc::new(client),
+                peer,
+                Self {
+                    started,
+                    notifications,
+                },
+            )
+        }
+
+        async fn started(&mut self) -> PendingElicitation {
+            within(self.started.recv())
+                .await
+                .expect("handler did not start")
+        }
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_key_allows_requests_and_notifications() {
+        let (client, mut peer, mut host) = Host::connect().await;
+        let call = start_tool(&client);
+        let initial = peer.request("tools/call").await;
+        peer.respond(&initial, input_required(["first"]));
+        let input = host.started().await;
+
+        peer.list_tools(&client).await;
+        peer.send(json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}));
+        assert!(matches!(
+            within(host.notifications.recv()).await,
+            Some(ServerNotification::ToolsListChanged)
+        ));
+        peer.assert_idle();
+
+        input.answer.send(Ok(accept())).unwrap();
+        finish_tool(&mut peer, json!({"first": {"action": "accept"}})).await;
+        within(call).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn handler_can_request_tools_from_its_own_client() {
+        struct ReentrantHandler(Arc<tokio::sync::OnceCell<std::sync::Weak<McpClient>>>);
+
+        #[async_trait]
+        impl ClientHandler for ReentrantHandler {
+            async fn handle_elicit(
+                &self,
+                _: ElicitRequestParams,
+            ) -> std::result::Result<ElicitResult, JsonRpcError> {
+                let client = self.0.get().unwrap().upgrade().unwrap();
+                client
+                    .list_tools()
+                    .await
+                    .map_err(|error| JsonRpcError::internal_error(error.to_string()))?;
+                Ok(accept())
+            }
+        }
+
+        let cell = Arc::new(tokio::sync::OnceCell::new());
+        let (client, mut peer) = connect(ReentrantHandler(cell.clone())).await;
+        let client = Arc::new(client);
+        cell.set(Arc::downgrade(&client)).unwrap();
+        let call = start_tool(&client);
+        let initial = peer.request("tools/call").await;
+        peer.respond(&initial, input_required(["first"]));
+        let nested = peer.request("tools/list").await;
+        assert_ne!(initial["id"], nested["id"]);
+        peer.respond(&nested, json!({"resultType": "complete", "tools": []}));
+        finish_tool(&mut peer, json!({"first": {"action": "accept"}})).await;
+        within(call).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn keys_overlap_with_a_bounded_window_and_keep_their_responses() {
+        const WINDOW: usize = 16;
+        let (client, mut peer, mut host) = Host::connect().await;
+        let call = start_tool(&client);
+        let initial = peer.request("tools/call").await;
+        let keys = (0..=WINDOW)
+            .map(|index| format!("{index:02}"))
+            .collect::<Vec<_>>();
+        peer.respond(&initial, input_required(keys.clone()));
+
+        let mut active = Vec::new();
+        for _ in 0..WINDOW {
+            active.push(host.started().await);
+        }
+        assert!(matches!(
+            host.started.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let first_finished = active.pop().unwrap();
+        let expected: serde_json::Map<String, Value> = keys
+            .into_iter()
+            .map(|key| {
+                let action = if key == first_finished.key {
+                    "decline"
+                } else {
+                    "accept"
+                };
+                (key, json!({"action": action}))
+            })
+            .collect();
+        first_finished
+            .answer
+            .send(Ok(ElicitResult {
+                action: ElicitAction::Decline,
+                ..accept()
+            }))
+            .unwrap();
+        let last_started = host.started().await;
+        peer.assert_idle();
+
+        last_started.answer.send(Ok(accept())).unwrap();
+        for input in active.into_iter().rev() {
+            input.answer.send(Ok(accept())).unwrap();
+        }
+        finish_tool(&mut peer, Value::Object(expected)).await;
+        within(call).await.unwrap().unwrap();
+        peer.assert_idle();
+    }
+
+    #[tokio::test]
+    async fn prompt_and_resource_retries_send_the_keyed_answer() {
+        let (client, mut peer, mut host) = Host::connect().await;
+        tokio::join!(
+            within(async {
+                client.get_prompt("prompt", None).await.unwrap();
+                client.read_resource("file:///resource").await.unwrap();
+            }),
+            async {
+                for (method, complete) in [
+                    (
+                        "prompts/get",
+                        json!({"resultType": "complete", "messages": []}),
+                    ),
+                    (
+                        "resources/read",
+                        json!({"resultType": "complete", "contents": []}),
+                    ),
+                ] {
+                    let initial = peer.request(method).await;
+                    peer.respond(&initial, input_required(["approval"]));
+                    host.started().await.answer.send(Ok(accept())).unwrap();
+
+                    let retry = peer.request(method).await;
+                    assert_ne!(retry["id"], initial["id"]);
+                    assert_eq!(retry["params"]["requestState"], "opaque state");
+                    assert_eq!(
+                        retry["params"]["inputResponses"],
+                        json!({"approval": {"action": "accept"}})
+                    );
+                    peer.respond(&retry, complete);
+                }
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_error_cancels_its_siblings_without_a_partial_retry() {
+        let (client, mut peer, mut host) = Host::connect().await;
+        let call = start_tool(&client);
+        let initial = peer.request("tools/call").await;
+        peer.respond(&initial, input_required(["success", "failure", "pending"]));
+        let mut started = HashMap::new();
+        for _ in 0..3 {
+            let input = host.started().await;
+            started.insert(input.key.clone(), input);
+        }
+        let success = started.remove("success").unwrap();
+        success.answer.send(Ok(accept())).unwrap();
+        within(success.finished).await.unwrap();
+
+        started
+            .remove("failure")
+            .unwrap()
+            .answer
+            .send(Err(JsonRpcError::internal_error("input failed")))
+            .unwrap();
+        let pending = started.remove("pending").unwrap();
+        pending.assert_cancelled().await;
+        assert!(matches!(
+            within(call).await.unwrap(),
+            Err(Error::JsonRpc(error)) if error.message == "input failed"
+        ));
+
+        peer.list_tools(&client).await;
+        peer.assert_idle();
+    }
+
+    #[tokio::test]
+    async fn task_wait_sends_a_keyed_update_before_resuming_polling() {
+        let (client, mut peer, mut host) = Host::connect().await;
+        let call = tokio::spawn(async move { client.task_wait("task-1").await });
+        let get = peer.request("tasks/get").await;
+        assert_eq!(get["params"]["taskId"], "task-1");
+        let mut response = task_result("input_required");
+        response["inputRequests"] = input_requests(["approval"]);
+        peer.respond(&get, response);
+        host.started().await.answer.send(Ok(accept())).unwrap();
+
+        let update = peer.request("tasks/update").await;
+        assert_eq!(update["params"]["taskId"], "task-1");
+        assert_eq!(
+            update["params"]["inputResponses"],
+            json!({"approval": {"action": "accept"}})
+        );
+        peer.respond(&update, json!({"resultType": "complete"}));
+        let next_get = peer.request("tasks/get").await;
+        assert_eq!(next_get["params"]["taskId"], "task-1");
+        let mut completed = task_result("completed");
+        completed["result"] = json!({"resultType": "complete", "content": []});
+        peer.respond(&next_get, completed);
+        assert_eq!(
+            within(call).await.unwrap().unwrap().status,
+            TaskStatus::Completed
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum CancelBy {
+        Shutdown,
+        TransportClose,
+        Reset,
+        CallerDrop,
+        LoopAbort,
+    }
+
+    async fn cancels_active_input(trigger: CancelBy) {
+        let (client, mut peer, mut host) = Host::connect().await;
+        let waiting_client = Arc::clone(&client);
+        let call = tokio::spawn(async move { waiting_client.task_wait("task-1").await });
+        let get = peer.request("tasks/get").await;
+        let mut response = task_result("input_required");
+        response["inputRequests"] = input_requests(["approval"]);
+        peer.respond(&get, response);
+        let input = host.started().await;
+
+        match trigger {
+            // Public shutdown consumes the client. Send the same command
+            // while task_wait still holds its borrow.
+            CancelBy::Shutdown => client
+                .session
+                .command_tx
+                .send(LoopCommand::Shutdown)
+                .await
+                .unwrap(),
+            CancelBy::TransportClose => drop(peer.incoming.take()),
+            CancelBy::Reset => within(client.session.reset_transport(false)).await.unwrap(),
+            CancelBy::CallerDrop => call.abort(),
+            CancelBy::LoopAbort => client.task.as_ref().unwrap().abort(),
+        }
+        input.assert_cancelled().await;
+        let result = within(call).await;
+        match trigger {
+            CancelBy::CallerDrop => assert!(result.unwrap_err().is_cancelled()),
+            _ => assert!(matches!(
+                result.unwrap(), Err(Error::Transport(message)) if message == "Input resolution stopped"
+            )),
+        }
+        match trigger {
+            CancelBy::Shutdown | CancelBy::TransportClose | CancelBy::LoopAbort => {
+                assert_eq!(within(peer.outgoing.recv()).await, None);
+            }
+            CancelBy::Reset | CancelBy::CallerDrop => {
+                if matches!(trigger, CancelBy::Reset) {
+                    peer.discover(&client).await;
+                }
+                peer.list_tools(&client).await;
+                peer.assert_idle();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_active_inputs() {
+        cancels_active_input(CancelBy::Shutdown).await;
+    }
+
+    #[tokio::test]
+    async fn transport_close_cancels_active_inputs() {
+        cancels_active_input(CancelBy::TransportClose).await;
+    }
+
+    #[tokio::test]
+    async fn reset_cancels_active_inputs() {
+        cancels_active_input(CancelBy::Reset).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_the_caller_cancels_active_inputs() {
+        cancels_active_input(CancelBy::CallerDrop).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_one_caller_leaves_other_rounds_active() {
+        let (client, mut peer, mut host) = Host::connect().await;
+        let first = start_tool(&client);
+        let initial = peer.request("tools/call").await;
+        peer.respond(&initial, input_required(["abandoned"]));
+        let abandoned = host.started().await;
+
+        let second = start_tool(&client);
+        let initial = peer.request("tools/call").await;
+        peer.respond(&initial, input_required(["kept"]));
+        let kept = host.started().await;
+
+        first.abort();
+        abandoned.assert_cancelled().await;
+        assert!(within(first).await.unwrap_err().is_cancelled());
+        assert!(!kept.token.is_cancelled());
+        kept.answer.send(Ok(accept())).unwrap();
+        finish_tool(&mut peer, json!({"kept": {"action": "accept"}})).await;
+        within(second).await.unwrap().unwrap();
+        peer.assert_idle();
+    }
+
+    #[tokio::test]
+    async fn aborting_the_loop_cancels_active_inputs() {
+        cancels_active_input(CancelBy::LoopAbort).await;
+    }
+
+    #[tokio::test]
+    async fn an_answer_from_before_reset_cannot_reach_the_new_generation() {
+        let (client, mut peer, mut host) = Host::connect().await;
+        let mut call = std::pin::pin!(client.call_tool("work", json!({})));
+        let input = tokio::select! {
+            result = &mut call => panic!("tool must wait for input: {result:?}"),
+            input = async {
+                let initial = peer.request("tools/call").await;
+                peer.respond(&initial, input_required(["first"]));
+                host.started().await
+            } => input,
+        };
+        // Keep the caller paused while the worker returns the answer and the
+        // loop switches generation. The next poll would otherwise retry it.
+        input.answer.send(Ok(accept())).unwrap();
+        within(input.finished).await.unwrap();
+        within(client.session.reset_transport(false)).await.unwrap();
+        peer.discover(&client).await;
+
+        assert!(matches!(
+            within(call).await,
+            Err(Error::Transport(message)) if message == "Session expired before the request was sent"
+        ));
+        peer.list_tools(&client).await;
+        peer.assert_idle();
+    }
 }
 
 // =========================================================================
