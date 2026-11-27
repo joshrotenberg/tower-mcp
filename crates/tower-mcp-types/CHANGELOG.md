@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.29.0] - 2026-11-27
+
+### Features
+
+- **client:** Reusable pre-dispatch tool-call policy hook ([#1702](https://github.com/joshrotenberg/tower-mcp/pull/1702))
+
+
+
 ## [0.28.0] - 2026-11-24
 
 ### Bug Fixes
