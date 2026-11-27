@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.29.1] - 2026-11-27
+
+### Bug Fixes
+
+- **client:** Keep the HTTP transport open after one background POST fails ([#1714](https://github.com/joshrotenberg/tower-mcp/pull/1714))
+
+
+
 ## [0.29.0] - 2026-11-27
 
 ### Bug Fixes
