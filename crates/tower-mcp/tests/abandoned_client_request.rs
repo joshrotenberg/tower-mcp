@@ -67,8 +67,6 @@ fn sample_params() -> CreateMessageParams {
 /// - `confirm` awaits an elicitation;
 /// - `sample_with_timeout` gives up on sampling after [`SAMPLE_DEADLINE`];
 /// - `marker` sends the client a `ping` request and waits for the answer;
-/// - `spawn_sample` spawns a task that samples until released, reports how
-///   that ended, and returns;
 /// - `elicit_in_spawned_task_then_return` spawns a task that awaits an
 ///   elicitation with a cloned context, and returns once released, leaving
 ///   that task still waiting;
@@ -101,25 +99,6 @@ fn router(hooks: Hooks) -> McpRouter {
         .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
             ctx.request_raw("ping", json!({})).await?;
             Ok(CallToolResult::text("marker done"))
-        })
-        .build();
-    let spawn_hooks = hooks.clone();
-    let spawn_sample = ToolBuilder::new("spawn_sample")
-        .description("Sample from a spawned task until released")
-        .extractor_handler((), move |ctx: Context, RawArgs(_): RawArgs| {
-            let hooks = spawn_hooks.clone();
-            async move {
-                tokio::spawn(async move {
-                    let outcome = tokio::select! {
-                        result = ctx.sample(sample_params()) => {
-                            result.map(|_| ()).map_err(|e| e.to_string())
-                        }
-                        () = hooks.release.notified() => Err("released".to_string()),
-                    };
-                    let _ = hooks.spawned_results.send(outcome);
-                });
-                Ok(CallToolResult::text("spawned"))
-            }
         })
         .build();
     let elicit_hooks = hooks.clone();
@@ -164,7 +143,6 @@ fn router(hooks: Hooks) -> McpRouter {
         .tool(confirm)
         .tool(sample)
         .tool(marker)
-        .tool(spawn_sample)
         .tool(elicit_in_task)
 }
 
@@ -1133,10 +1111,6 @@ mod http {
 // WebSocket (binds a local socket)
 // ============================================================================
 
-/// The bidirectional WebSocket loop dispatches each request inline, so a
-/// handler that awaits sampling directly cannot have its request written
-/// until it returns (a pre-existing limitation). These tests sample from a
-/// task the handler spawns, which is the supported pattern there.
 #[cfg(feature = "websocket")]
 mod websocket {
     use super::*;
@@ -1149,13 +1123,23 @@ mod websocket {
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
 
-    async fn spawned_outcome(
-        outcomes: &mut mpsc::UnboundedReceiver<Result<(), String>>,
-    ) -> Result<(), String> {
-        tokio::time::timeout(STEP, outcomes.recv())
-            .await
-            .expect("the spawned sampling task finishes")
-            .unwrap()
+    fn sampling_tool(release: Arc<Notify>) -> tower_mcp::Tool {
+        ToolBuilder::new("sample_until_released")
+            .description("Await sampling until released")
+            .extractor_handler((), move |ctx: Context, RawArgs(_): RawArgs| {
+                let release = release.clone();
+                async move {
+                    let text = tokio::select! {
+                        result = ctx.sample(sample_params()) => {
+                            result?;
+                            "sampled"
+                        }
+                        () = release.notified() => "released",
+                    };
+                    Ok(CallToolResult::text(text))
+                }
+            })
+            .build()
     }
 
     struct Socket {
@@ -1165,6 +1149,10 @@ mod websocket {
 
     impl Socket {
         async fn connect(router: McpRouter) -> Self {
+            Self::connect_to(Self::serve(router).await).await
+        }
+
+        async fn serve(router: McpRouter) -> std::net::SocketAddr {
             let app = WebSocketTransport::new(router)
                 .with_sampling()
                 .into_router();
@@ -1173,6 +1161,10 @@ mod websocket {
             tokio::spawn(async move {
                 let _ = axum::serve(listener, app).await;
             });
+            addr
+        }
+
+        async fn connect_to(addr: std::net::SocketAddr) -> Self {
             let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
                 .await
                 .expect("connect");
@@ -1215,64 +1207,179 @@ mod websocket {
                 .await;
         }
 
-        /// Requests are handled in order on the connection's loop, which
-        /// also writes cancellations; a ping answered after a cancellation
-        /// was queued shows everything before it.
+        async fn start_sample(&mut self, id: i64) -> Value {
+            self.send(call(id, "sample_until_released")).await;
+            self.expect("sampling/createMessage", |f| {
+                is_request(f, "sampling/createMessage")
+            })
+            .await
+        }
+
+        async fn answer_sample(&mut self, sample: &Value) {
+            self.send(json!({
+                "jsonrpc": "2.0", "id": sample["id"],
+                "result": {"role": "assistant", "content": {"type": "text", "text": "hi"}, "model": "m"}
+            }))
+            .await;
+        }
+
+        async fn answer_elicitation(&mut self, elicit: &Value) {
+            self.send(json!({
+                "jsonrpc": "2.0", "id": elicit["id"],
+                "result": {"action": "accept", "content": {"confirmed": true}}
+            }))
+            .await;
+        }
+
+        async fn expect_tool_result(&mut self, id: i64, text: &str) {
+            let response = self
+                .expect("tool response", |f| is_response_to(f, id))
+                .await;
+            assert_eq!(response["result"]["content"][0]["text"], text);
+        }
+
+        /// Read through a server-written close frame so the transcript includes
+        /// every application frame the writer sent on this connection.
         async fn finish(mut self) -> Vec<Value> {
-            self.send(json!({"jsonrpc": "2.0", "id": 99, "method": "ping"}))
-                .await;
-            self.expect("ping response", |f| is_response_to(f, 99))
-                .await;
+            self.ws.send(Message::Binary(vec![0].into())).await.unwrap();
+            loop {
+                match tokio::time::timeout(STEP, self.ws.next()).await.unwrap() {
+                    Some(Ok(Message::Text(text))) => {
+                        self.frames.push(serde_json::from_str(&text).unwrap());
+                    }
+                    Some(Ok(Message::Close(Some(frame)))) => {
+                        assert_eq!(u16::from(frame.code), 1003);
+                        break;
+                    }
+                    other => panic!("expected a text or close frame, got {other:?}"),
+                }
+            }
             self.frames
         }
     }
 
     #[tokio::test]
     async fn websocket_abandoned_sampling_is_cancelled() {
-        let (hooks, mut outcomes) = hooks();
-        let mut socket = Socket::connect(router(hooks.clone())).await;
+        let release = Arc::new(Notify::new());
+        let (hooks, _) = hooks();
+        let mut socket = Socket::connect(router(hooks).tool(sampling_tool(release.clone()))).await;
         socket.handshake().await;
 
-        socket.send(call(2, "spawn_sample")).await;
-        let sample = socket
-            .expect("sampling/createMessage", |f| {
-                is_request(f, "sampling/createMessage")
-            })
-            .await;
-        // Only now, with the request on the wire, does the task give up.
-        hooks.release.notify_one();
-        assert_eq!(spawned_outcome(&mut outcomes).await, Err("released".into()));
+        let sample = socket.start_sample(2).await;
+        release.notify_one();
         socket.expect("notifications/cancelled", is_cancel).await;
+        if !socket.frames.iter().any(|frame| is_response_to(frame, 2)) {
+            socket
+                .expect("tool response", |frame| is_response_to(frame, 2))
+                .await;
+        }
+        socket.answer_sample(&sample).await;
 
         let frames = socket.finish().await;
         assert_cancelled_once(&frames, &sample);
-        let response = &frames[position(&frames, |f| is_response_to(f, 2))];
-        assert_eq!(response["result"]["content"][0]["text"], "spawned");
+        let response = &frames[position(&frames, |frame| is_response_to(frame, 2))];
+        assert_eq!(response["result"]["content"][0]["text"], "released");
     }
 
     #[tokio::test]
-    async fn websocket_answered_sampling_is_not_cancelled() {
-        let (hooks, mut outcomes) = hooks();
-        let mut socket = Socket::connect(router(hooks.clone())).await;
+    async fn websocket_direct_sampling_and_elicitation_can_complete_out_of_order() {
+        let (hooks, _) = hooks();
+        let router = router(hooks).tool(sampling_tool(Arc::new(Notify::new())));
+        let mut socket = Socket::connect(router).await;
         socket.handshake().await;
 
-        socket.send(call(2, "spawn_sample")).await;
-        let sample = socket
-            .expect("sampling/createMessage", |f| {
-                is_request(f, "sampling/createMessage")
+        let sample = socket.start_sample(2).await;
+        socket.send(call(3, "confirm")).await;
+        let elicit = socket
+            .expect("elicitation/create", |f| {
+                is_request(f, "elicitation/create")
             })
             .await;
+        socket.answer_elicitation(&elicit).await;
+        socket.expect_tool_result(3, "\"accept\"").await;
+        assert!(!socket.frames.iter().any(|f| is_response_to(f, 2)));
+
+        socket.answer_sample(&sample).await;
+        socket.expect_tool_result(2, "sampled").await;
+        assert_never_cancelled(&socket.finish().await);
+    }
+
+    fn cancellation_probe(observed: mpsc::UnboundedSender<bool>) -> tower_mcp::Tool {
+        ToolBuilder::new("cancellation_probe")
+            .description("Elicit and report the cancellation state")
+            .extractor_handler((), move |ctx: Context, RawArgs(_): RawArgs| {
+                let observed = observed.clone();
+                async move {
+                    let result = ctx.elicit_form(elicit_params()).await;
+                    observed.send(ctx.is_cancelled()).unwrap();
+                    result?;
+                    Ok(CallToolResult::text("answered"))
+                }
+            })
+            .build()
+    }
+
+    async fn start_probe(socket: &mut Socket) -> Value {
+        socket.send(call(2, "cancellation_probe")).await;
         socket
+            .expect("elicitation/create", |f| {
+                is_request(f, "elicitation/create")
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn websocket_peer_cancel_reaches_only_its_own_handler() {
+        let (observed, mut cancellation) = mpsc::unbounded_channel();
+        let addr = Socket::serve(McpRouter::new().tool(cancellation_probe(observed))).await;
+        let mut cancelled = Socket::connect_to(addr).await;
+        let mut unaffected = Socket::connect_to(addr).await;
+        cancelled.handshake().await;
+        unaffected.handshake().await;
+
+        let first = start_probe(&mut cancelled).await;
+        let second = start_probe(&mut unaffected).await;
+        cancelled
             .send(json!({
-                "jsonrpc": "2.0", "id": sample["id"],
-                "result": {"role": "assistant", "content": {"type": "text", "text": "hi"}, "model": "m"}
+                "jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 2}
             }))
             .await;
-        // Sending the reply does not mean the server has read it. Wait until
-        // the task has its answer; only then can nothing abandon the request.
-        // The task is never released.
-        assert_eq!(spawned_outcome(&mut outcomes).await, Ok(()));
+        cancelled.expect("nested cancellation", is_cancel).await;
+        assert_eq!(
+            tokio::time::timeout(STEP, cancellation.recv())
+                .await
+                .unwrap(),
+            Some(true)
+        );
 
-        assert_never_cancelled(&socket.finish().await);
+        unaffected.answer_elicitation(&second).await;
+        unaffected.expect_tool_result(2, "answered").await;
+        assert_eq!(
+            tokio::time::timeout(STEP, cancellation.recv())
+                .await
+                .unwrap(),
+            Some(false)
+        );
+
+        let frames = cancelled.finish().await;
+        assert_cancelled_once(&frames, &first);
+        assert!(!frames.iter().any(|f| is_response_to(f, 2)), "{frames:#?}");
+        assert_never_cancelled(&unaffected.finish().await);
+    }
+
+    #[tokio::test]
+    async fn websocket_close_cancels_a_waiting_handler() {
+        let (observed, mut cancellation) = mpsc::unbounded_channel();
+        let mut socket = Socket::connect(McpRouter::new().tool(cancellation_probe(observed))).await;
+        socket.handshake().await;
+        start_probe(&mut socket).await;
+        socket.ws.send(Message::Close(None)).await.unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(STEP, cancellation.recv())
+                .await
+                .unwrap(),
+            Some(true)
+        );
     }
 }

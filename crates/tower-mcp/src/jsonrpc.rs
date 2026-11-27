@@ -35,6 +35,9 @@ use crate::router::{
 };
 use crate::{ProtocolSupport, ProtocolSupportError};
 
+#[cfg(feature = "websocket")]
+type AdmittedRequests = std::collections::HashMap<crate::protocol::RequestId, PeerCancelled>;
+
 /// Tower layer that adds JSON-RPC 2.0 framing to an MCP service.
 ///
 /// This is the standard way to compose `JsonRpcService` with other tower
@@ -96,6 +99,8 @@ pub struct JsonRpcService<S> {
     extensions: Extensions,
     protocol_support: ProtocolSupport,
     negotiated_revision: Arc<RwLock<Option<McpProtocolRevision>>>,
+    #[cfg(feature = "websocket")]
+    admitted_requests: Option<Arc<AdmittedRequests>>,
 }
 
 impl<S> JsonRpcService<S> {
@@ -106,6 +111,8 @@ impl<S> JsonRpcService<S> {
             extensions: Extensions::new(),
             protocol_support: ProtocolSupport::default(),
             negotiated_revision: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "websocket")]
+            admitted_requests: None,
         }
     }
 
@@ -123,6 +130,24 @@ impl<S> JsonRpcService<S> {
     pub(crate) fn with_connection_cancellation(mut self, token: CancellationToken) -> Self {
         self.extensions.insert(ConnectionCancellation(token));
         self
+    }
+
+    #[cfg(feature = "websocket")]
+    pub(crate) fn with_admitted_requests(mut self, requests: AdmittedRequests) -> Self {
+        self.admitted_requests = Some(Arc::new(requests));
+        self
+    }
+
+    fn peer_cancellation(&self, _request: &JsonRpcRequest) -> PeerCancelled {
+        #[cfg(feature = "websocket")]
+        if let Some(peer) = self
+            .admitted_requests
+            .as_ref()
+            .and_then(|requests| requests.get(&_request.id))
+        {
+            return peer.clone();
+        }
+        PeerCancelled::default()
     }
 
     /// Set the exact protocol versions this service accepts and advertises.
@@ -342,12 +367,14 @@ impl<S> JsonRpcService<S> {
             + 'static,
         S::Future: Send,
     {
+        let peer_cancelled = self.peer_cancellation(&req);
         process_answerable_request(
             self.inner.clone(),
             req,
             self.extensions.clone(),
             self.protocol_support.clone(),
             self.negotiated_revision.clone(),
+            peer_cancelled,
         )
         .await
     }
@@ -422,14 +449,16 @@ impl<S> JsonRpcService<S> {
                 let protocol_support = self.protocol_support.clone();
                 let negotiated_revision = self.negotiated_revision.clone();
                 let req_id = req.id.clone();
+                let peer_cancelled = answerable.then(|| self.peer_cancellation(&req));
                 async move {
-                    let result = if answerable {
+                    let result = if let Some(peer_cancelled) = peer_cancelled {
                         process_answerable_request(
                             inner,
                             req,
                             extensions,
                             protocol_support,
                             negotiated_revision,
+                            peer_cancelled,
                         )
                         .await
                     } else {
@@ -538,6 +567,8 @@ where
             extensions: self.extensions.clone(),
             protocol_support: self.protocol_support.clone(),
             negotiated_revision: self.negotiated_revision.clone(),
+            #[cfg(feature = "websocket")]
+            admitted_requests: self.admitted_requests.clone(),
         }
     }
 }
@@ -601,6 +632,7 @@ async fn process_answerable_request<S>(
     mut extensions: Extensions,
     configured_protocol_support: ProtocolSupport,
     negotiated_revision: Arc<RwLock<Option<McpProtocolRevision>>>,
+    peer_cancelled: PeerCancelled,
 ) -> std::result::Result<Option<JsonRpcResponse>, Error>
 where
     S: Service<RouterRequest, Response = RouterResponse, Error = std::convert::Infallible>
@@ -609,8 +641,11 @@ where
         + 'static,
     S::Future: Send,
 {
-    let peer_cancelled = PeerCancelled::default();
-    if req.method != "initialize" {
+    let method_is_cancellable = req.method != "initialize";
+    if method_is_cancellable {
+        if peer_cancelled.is_marked() {
+            return Ok(None);
+        }
         extensions.insert(peer_cancelled.clone());
     }
     let id = req.id.clone();
@@ -622,7 +657,7 @@ where
         negotiated_revision,
     )
     .await;
-    if peer_cancelled.is_marked() {
+    if method_is_cancellable && peer_cancelled.is_marked() {
         tracing::debug!(request_id = ?id, "Not answering a request the peer cancelled");
         return Ok(None);
     }
@@ -663,6 +698,8 @@ where
         extensions: extensions.clone(),
         protocol_support: protocol_support.clone(),
         negotiated_revision: negotiated_revision.clone(),
+        #[cfg(feature = "websocket")]
+        admitted_requests: None,
     };
     let request_value = serde_json::to_value(&req).map_err(Error::Serialization)?;
     if let Err(error) =

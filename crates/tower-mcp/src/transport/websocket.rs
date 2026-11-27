@@ -67,9 +67,10 @@
 //! }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Router,
@@ -80,20 +81,21 @@ use axum::{
     response::Response,
     routing::get,
 };
-use futures::{SinkExt, StreamExt};
+use futures::{Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::{Mutex, RwLock, watch};
+use tokio::task::{Id, JoinSet};
 
 use crate::context::{
-    ChannelClientRequester, ClientRequesterHandle, OutgoingRequest, OutgoingRequestReceiver,
-    OutgoingRequestSender, outgoing_request_channel,
+    CancellationToken, ChannelClientRequester, ClientRequesterHandle, OutgoingRequest,
+    OutgoingRequestReceiver, OutgoingRequestSender, outgoing_request_channel,
 };
 use crate::error::{Error, Result};
 use crate::jsonrpc::JsonRpcService;
 use crate::protocol::{
-    JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpNotification,
-    RequestId,
+    JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseMessage,
+    McpNotification, RequestId,
 };
-use crate::router::{McpRouter, RouterRequest, RouterResponse};
+use crate::router::{InFlightGuard, McpRouter, PeerCancelled, RouterRequest, RouterResponse};
 use crate::transport::pending::{
     AbandonSender, PendingClientRequests, abandon_channel, cancelled_notification_json,
 };
@@ -101,6 +103,17 @@ use crate::transport::service::{
     CatchError, InjectAnnotations, McpBoxService, ServiceFactory, identity_factory,
 };
 use crate::{ProtocolSupport, ProtocolSupportError};
+
+const CANCEL_GRACE: Duration = Duration::from_millis(500);
+const OUTGOING_REQUEST_CAPACITY: usize = 32;
+
+struct CancelConnectionOnDrop<'a>(&'a CancellationToken);
+
+impl Drop for CancelConnectionOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
 
 /// Session state for WebSocket transport
 struct Session {
@@ -235,20 +248,21 @@ struct AppState {
 /// subprotocol is an upgrade-time compatibility hint constrained by this
 /// transport's exact [`ProtocolSupport`] allow-list.
 ///
-/// Connection and cancellation semantics remain those of this custom binding:
-/// a WebSocket close terminates the connection, and reconnecting a stored
-/// session closes the older socket. It does not currently cancel an in-flight
-/// handler. `notifications/cancelled` is processed between requests, so it
-/// cannot interrupt a handler that is already executing. Final
-/// `subscriptions/listen` multiplexing is not implemented on this binding.
+/// A WebSocket close terminates the connection, and replacing a connection
+/// closes the older socket. Final `subscriptions/listen` multiplexing is not
+/// implemented on this binding.
 ///
-/// With [`with_sampling`](Self::with_sampling), requests are still
-/// dispatched one at a time on the connection's loop, and that same loop
-/// writes server-to-client requests and reads their responses. A handler
-/// that awaits `ctx.sample()` or `ctx.elicit_form()` directly therefore
-/// cannot have its request written until it returns. Issue such requests
-/// from a task the handler spawns. If that task drops the request after it
-/// was written, the client receives `notifications/cancelled` for it.
+/// With [`with_sampling`](Self::with_sampling), handlers can directly await
+/// `ctx.sample()` or `ctx.elicit_form()`. Requests can run concurrently, and
+/// replies can arrive out of order. Client `notifications/cancelled` cancel
+/// the named request, and closing the socket cancels all of its requests.
+/// Without that option, the connection processes requests one at a time and
+/// handles client cancellation and close frames only after the current
+/// request finishes.
+///
+/// In bidirectional mode, the connection's per-request cancellation token
+/// takes precedence over a `CancellationToken` injected by middleware or
+/// copied from the upgrade request.
 pub struct WebSocketTransport {
     router: McpRouter,
     /// Types copied from each upgrade request's extensions into the
@@ -811,7 +825,7 @@ async fn handle_socket(
 
     if state.sampling_enabled {
         handle_socket_bidirectional(
-            socket,
+            socket.split(),
             session,
             &session_id,
             mcp_extensions,
@@ -946,29 +960,36 @@ async fn handle_socket_simple(
 }
 
 /// Handle WebSocket connection with sampling support (bidirectional mode)
-async fn handle_socket_bidirectional(
-    socket: WebSocket,
+async fn handle_socket_bidirectional<S, R, E>(
+    (mut sender, mut receiver): (S, R),
     session: Arc<Session>,
     session_id: &str,
-    _mcp_extensions: crate::router::Extensions,
+    mcp_extensions: crate::router::Extensions,
     protocol_support: ProtocolSupport,
     mut cancel_rx: watch::Receiver<bool>,
-) {
+) where
+    S: Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+    R: Stream<Item = std::result::Result<Message, E>> + Unpin,
+    E: std::fmt::Display,
+{
     // Create channels for outgoing requests
     let (request_tx, mut request_rx): (OutgoingRequestSender, OutgoingRequestReceiver) =
-        outgoing_request_channel(32);
+        outgoing_request_channel(OUTGOING_REQUEST_CAPACITY);
 
     // Create client requester for the router
     let client_requester: ClientRequesterHandle = Arc::new(ChannelClientRequester::new(request_tx));
 
-    // Clone router and configure with client requester
+    let connection = CancellationToken::new();
     let router = session
         .router
         .clone()
-        .with_client_requester(client_requester);
-    let mut service = JsonRpcService::new((session.service_factory)(router.clone()))
-        .with_extensions(_mcp_extensions)
-        .protocol_support(protocol_support);
+        .with_client_requester(client_requester)
+        .with_connection_in_flight();
+    let service = JsonRpcService::new((session.service_factory)(router.clone()))
+        .with_extensions(mcp_extensions)
+        .protocol_support(protocol_support)
+        .with_connection_cancellation(connection.clone());
 
     // Track pending outgoing requests, and the ids of those whose waiter
     // gave up so the client can be told (#1705).
@@ -978,12 +999,45 @@ async fn handle_socket_bidirectional(
     // client.
     let _release_pending = pending_requests.clear_on_drop();
 
-    let (sender, mut receiver) = socket.split();
-    let sender = Arc::new(Mutex::new(sender));
+    let mut in_flight = JoinSet::new();
+    let mut request_ids = HashMap::new();
+    let _cancel_on_drop = CancelConnectionOnDrop(&connection);
+    let mut queued = VecDeque::<Incoming>::new();
+    let mut initializing = None;
 
-    let session_id_owned = session_id.to_string();
+    let close = 'socket: loop {
+        // An initialize frame changes both the session phase and the revision
+        // used to inspect later frames. Earlier tasks can keep running. Resume
+        // admitting later frames in receive order after initialize's response,
+        // while still accepting replies and cancels.
+        while initializing.is_none() {
+            let Some(input) = queued.pop_front() else {
+                break;
+            };
+            match input {
+                Incoming::Notification(parsed, notification) => {
+                    handle_notification(&parsed, notification, &service, &router);
+                }
+                Incoming::Request(request) => {
+                    let initializes = request.initializes;
+                    match request.dispatch(&service, &mut in_flight) {
+                        Dispatch::Spawned { task, request_id } => {
+                            request_ids.insert(task, request_id);
+                            if initializes {
+                                initializing = Some(task);
+                            }
+                        }
+                        Dispatch::Rejected(response) => {
+                            if let Err(error) = send_response(&mut sender, &response).await {
+                                tracing::error!(%error, "Failed to send WebSocket response");
+                                break 'socket None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
-    loop {
         tokio::select! {
             // Handle incoming messages from client
             msg = receiver.next() => {
@@ -991,9 +1045,9 @@ async fn handle_socket_bidirectional(
                     Some(Ok(m)) => m,
                     Some(Err(e)) => {
                         tracing::error!(error = %e, "WebSocket receive error");
-                        break;
+                        break None;
                     }
-                    None => break,
+                    None => break None,
                 };
 
                 match msg {
@@ -1002,39 +1056,33 @@ async fn handle_socket_bidirectional(
                         // (#1303, #1335): both server loops must strip a
                         // leading BOM the way the crate's own client does.
                         let text = crate::framing::clean_input_line(&text);
-                        let result = handle_incoming_message(
-                            text,
-                            &mut service,
-                            &router,
-                            &pending_requests,
-                            sender.clone(),
-                        ).await;
-                        if let Err(e) = result {
-                            tracing::error!(error = %e, "Error handling incoming message");
+                        match handle_incoming_message(
+                            text, &service, &router, &pending_requests, &connection,
+                        ) {
+                            Ok(Some(input)) => queued.push_back(input),
+                            Ok(None) => {}
+                            Err(error) => tracing::error!(%error, "Error handling incoming message"),
                         }
                     }
                     Message::Binary(_) => {
                         // MCP spec (SEP-1288) requires text frames only.
                         // Binary frames MUST result in close code 1003 (Unsupported Data).
-                        tracing::warn!(session_id = %session_id_owned, "Received binary frame, closing with 1003");
-                        let mut s = sender.lock().await;
-                        let _ = s.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                        tracing::warn!(%session_id, "Received binary frame, closing with 1003");
+                        break Some(Message::Close(Some(axum::extract::ws::CloseFrame {
                             code: 1003,
                             reason: "Binary frames are not supported by MCP".into(),
-                        }))).await;
-                        break;
+                        })));
                     }
                     Message::Ping(data) => {
-                        let mut sender = sender.lock().await;
                         if let Err(e) = sender.send(Message::Pong(data)).await {
                             tracing::error!(error = %e, "Failed to send pong");
-                            break;
+                            break None;
                         }
                     }
                     Message::Pong(_) => {}
                     Message::Close(_) => {
-                        tracing::info!(session_id = %session_id_owned, "WebSocket close received");
-                        break;
+                        tracing::info!(%session_id, "WebSocket close received");
+                        break None;
                     }
                 }
             }
@@ -1045,13 +1093,13 @@ async fn handle_socket_bidirectional(
                     outgoing,
                     &pending_requests,
                     abandon_tx.clone(),
-                    sender.clone(),
+                    &mut sender,
                 ).await;
                 // The socket cannot be written; stop rather than keep
                 // writing (or cancelling) on a broken connection.
                 if let Err(e) = result {
                     tracing::error!(error = %e, "Error sending outgoing request");
-                    break;
+                    break None;
                 }
             }
 
@@ -1059,36 +1107,91 @@ async fn handle_socket_bidirectional(
             // on this loop, which also writes the requests, so a
             // cancellation never overtakes its request.
             Some(id) = abandon_rx.recv() => {
-                if let Some(json) = cancelled_notification_json(&id) {
-                    let mut s = sender.lock().await;
-                    if let Err(e) = s.send(Message::Text(json.into())).await {
-                        tracing::error!(error = %e, "Failed to send notifications/cancelled");
-                        break;
+                if let Some(json) = cancelled_notification_json(&id)
+                    && let Err(e) = sender.send(Message::Text(json.into())).await
+                {
+                    tracing::error!(error = %e, "Failed to send notifications/cancelled");
+                    break None;
+                }
+            }
+
+            Some(result) = in_flight.join_next_with_id(), if !in_flight.is_empty() => {
+                let task = match &result {
+                    Ok((task, _)) => *task,
+                    Err(error) => error.id(),
+                };
+                let request_id = request_ids.remove(&task).flatten();
+                if initializing == Some(task) {
+                    initializing = None;
+                }
+                let response = match result {
+                    Ok((_, result)) => result.map_err(|error| {
+                        tracing::error!(%error, "Error processing message");
+                        router.transport_internal_error(&error)
+                    }),
+                    Err(error) => {
+                        tracing::error!(%error, "Request dispatch task failed");
+                        if !error.is_panic() {
+                            continue;
+                        }
+                        Err(router.transport_internal_error(&"Request dispatch task panicked"))
                     }
+                };
+                let response = response.unwrap_or_else(|error| {
+                    Some(JsonRpcResponseMessage::Single(JsonRpcResponse::error(request_id, error)))
+                });
+                if let Some(response) = response
+                    && let Err(error) = send_response(&mut sender, &response).await
+                {
+                    tracing::error!(%error, "Failed to send WebSocket response");
+                    break None;
                 }
             }
 
             // Handle cancellation (zombie prevention)
             _ = cancel_rx.changed() => {
                 if *cancel_rx.borrow() {
-                    tracing::info!(session_id = %session_id_owned, "Connection superseded by new connection, closing");
-                    let mut s = sender.lock().await;
-                    let _ = s.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                    tracing::info!(%session_id, "Connection superseded by new connection, closing");
+                    break Some(Message::Close(Some(axum::extract::ws::CloseFrame {
                         code: 1000,
                         reason: "Connection replaced by newer WebSocket connection".into(),
-                    }))).await;
-                    break;
+                    })));
                 }
             }
         }
+    };
+
+    connection.cancel();
+    drop(request_rx);
+    pending_requests.clear();
+    drop(queued);
+
+    let close_socket = async move {
+        if let Some(close) = close {
+            let _ = sender.send(close).await;
+        }
+        drop(sender);
+        drop(receiver);
+    };
+    let drain = async {
+        while let Some(result) = in_flight.join_next().await {
+            match result {
+                Ok(Err(error)) => tracing::error!(%error, "Error processing message"),
+                Err(error) => tracing::error!(%error, "Request dispatch task failed"),
+                Ok(Ok(_)) => {}
+            }
+        }
+    };
+    if tokio::time::timeout(CANCEL_GRACE, async { tokio::join!(close_socket, drain) })
+        .await
+        .is_err()
+    {
+        in_flight.shutdown().await;
     }
 }
 
 /// Serialize `value` and send it as one text frame.
-///
-/// Every reply `handle_incoming_message` sends goes through here so the
-/// serialize-then-send pattern (and its error mapping) is written once.
-async fn send_response<S>(sender: &Mutex<S>, value: &impl serde::Serialize) -> Result<()>
+async fn send_response<S>(sender: &mut S, value: &impl serde::Serialize) -> Result<()>
 where
     S: futures::Sink<Message> + Unpin,
     S::Error: std::fmt::Display,
@@ -1096,14 +1199,12 @@ where
     let text = serde_json::to_string(value)
         .map_err(|error| Error::Transport(format!("Failed to serialize response: {error}")))?;
     sender
-        .lock()
-        .await
         .send(Message::Text(text.into()))
         .await
         .map_err(|error| Error::Transport(format!("Failed to send response: {error}")))
 }
 
-/// The id to answer with if `call_message` fails after `message` already
+/// The id to answer with if dispatch fails after `message` already
 /// parsed successfully. A batch has no single id to correlate against,
 /// matching what `call_message` itself does for its own within-batch errors
 /// (see the `Err(Error::JsonRpc(error))` arm in `JsonRpcService::call_message`).
@@ -1119,96 +1220,150 @@ fn correlating_id(message: &JsonRpcMessage) -> Option<RequestId> {
     }
 }
 
-/// Handle an incoming WebSocket message (bidirectional mode)
-async fn handle_incoming_message<S>(
+enum Incoming {
+    Notification(serde_json::Value, Option<JsonRpcNotification>),
+    Request(IncomingRequest),
+}
+
+enum Dispatch {
+    Spawned {
+        task: Id,
+        request_id: Option<RequestId>,
+    },
+    Rejected(JsonRpcResponse),
+}
+
+struct IncomingRequest {
+    parsed: serde_json::Value,
+    message: Option<JsonRpcMessage>,
+    initializes: bool,
+    cancellations: HashMap<RequestId, PeerCancelled>,
+    guards: Vec<InFlightGuard>,
+}
+
+impl IncomingRequest {
+    fn new(
+        parsed: serde_json::Value,
+        message: Option<JsonRpcMessage>,
+        router: &McpRouter,
+        connection: &CancellationToken,
+    ) -> Self {
+        let members = match &message {
+            Some(JsonRpcMessage::Single(request)) => std::slice::from_ref(request),
+            Some(JsonRpcMessage::Batch(requests)) => requests.as_slice(),
+            _ => &[],
+        };
+        let mut initializes = false;
+        let mut cancellations = HashMap::new();
+        let mut guards = Vec::new();
+        for request in members {
+            if request.method == "initialize" {
+                initializes = true;
+            } else {
+                cancellations.entry(request.id.clone()).or_insert_with(|| {
+                    let (peer, guard) = router.admit_request(request.id.clone(), connection);
+                    guards.push(guard);
+                    peer
+                });
+            }
+        }
+        Self {
+            parsed,
+            message,
+            initializes,
+            cancellations,
+            guards,
+        }
+    }
+
+    /// Spawn a validated request, or return the reply for a rejected frame.
+    fn dispatch(
+        self,
+        service: &JsonRpcService<McpBoxService>,
+        in_flight: &mut JoinSet<Result<Option<JsonRpcResponseMessage>>>,
+    ) -> Dispatch {
+        if let Err(error) = service.inspect_incoming_value(
+            &self.parsed,
+            crate::inspection::McpDirection::ClientToServer,
+        ) {
+            return Dispatch::Rejected(JsonRpcResponse::error(
+                crate::framing::error_response_id(&self.parsed, &error),
+                error,
+            ));
+        }
+
+        // An untagged enum's serde error exposes the Rust type name (#1272).
+        let Some(message) = self.message else {
+            return Dispatch::Rejected(crate::transport::stdio::parse_error_response(
+                "not a valid JSON-RPC request",
+            ));
+        };
+
+        let request_id = correlating_id(&message);
+        let mut service = service.clone().with_admitted_requests(self.cancellations);
+        let guards = self.guards;
+        let task = in_flight
+            .spawn(async move {
+                let _guards = guards;
+                service.call_message_answerable(message).await
+            })
+            .id();
+        Dispatch::Spawned { task, request_id }
+    }
+}
+
+/// Handle replies and cancellation as soon as they arrive. Requests and other
+/// notifications can wait behind an initialize frame that changes their revision.
+fn handle_incoming_message(
     text: &str,
-    service: &mut JsonRpcService<McpBoxService>,
+    service: &JsonRpcService<McpBoxService>,
     router: &McpRouter,
     pending_requests: &PendingClientRequests,
-    sender: Arc<Mutex<S>>,
-) -> Result<()>
-where
-    S: futures::Sink<Message> + Unpin,
-    S::Error: std::fmt::Display,
-{
+    connection: &CancellationToken,
+) -> Result<Option<Incoming>> {
     let parsed: serde_json::Value = serde_json::from_str(text)?;
-
-    // Classify before validating, then response before request: the same
-    // order `process_line` (stdio) and `process_message` (below) use
-    // (#1272, #1335). A malformed notification cannot be answered (there is
-    // nowhere to put the reply), and a response frame is always the peer's
-    // mistake on a binding that never sends requests of its own -- both get
-    // no reply rather than one derived from validation that was never meant
-    // to apply to them.
     match crate::framing::classify_frame(&parsed) {
         crate::framing::FrameClass::Notification => {
-            if let Err(error) = service
-                .inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
-            {
-                tracing::debug!(
-                    method = parsed.get("method").and_then(|m| m.as_str()),
-                    %error,
-                    "rejected an invalid notification"
-                );
-                return Ok(());
+            let notification = serde_json::from_str::<JsonRpcNotification>(text).ok();
+            if parsed.get("method").and_then(|m| m.as_str()) == Some("notifications/cancelled") {
+                handle_notification(&parsed, notification, service, router);
+            } else {
+                return Ok(Some(Incoming::Notification(parsed, notification)));
             }
-            if let Ok(notification) = serde_json::from_str::<JsonRpcNotification>(text) {
-                let mcp_notification = McpNotification::from_jsonrpc(&notification)?;
-                router.handle_notification(mcp_notification);
-            }
-            return Ok(());
         }
-        crate::framing::FrameClass::Response => {
-            handle_response(&parsed, pending_requests);
-            return Ok(());
+        crate::framing::FrameClass::Response => handle_response(&parsed, pending_requests),
+        crate::framing::FrameClass::Request => {
+            let message = serde_json::from_str(text).ok();
+            return Ok(Some(Incoming::Request(IncomingRequest::new(
+                parsed, message, router, connection,
+            ))));
         }
-        crate::framing::FrameClass::Request => {}
     }
+    Ok(None)
+}
 
+fn handle_notification(
+    parsed: &serde_json::Value,
+    notification: Option<JsonRpcNotification>,
+    service: &JsonRpcService<McpBoxService>,
+    router: &McpRouter,
+) {
     if let Err(error) =
-        service.inspect_incoming_value(&parsed, crate::inspection::McpDirection::ClientToServer)
+        service.inspect_incoming_value(parsed, crate::inspection::McpDirection::ClientToServer)
     {
-        return send_response(
-            &sender,
-            &JsonRpcResponse::error(crate::framing::error_response_id(&parsed, &error), error),
-        )
-        .await;
+        tracing::debug!(
+            method = parsed.get("method").and_then(|m| m.as_str()),
+            %error,
+            "rejected an invalid notification"
+        );
+        return;
     }
-
-    // Parse and process as a request (single or batch). The serde error is
-    // deliberately not surfaced: for an untagged enum it names the Rust
-    // type, which has no business on the wire (#1272). Guarding this parse
-    // rather than propagating it with `?` matters here specifically: the
-    // caller of this function only logs a returned `Err`, so an unguarded
-    // parse failure left the client with no reply at all (#1335).
-    let Ok(message) = serde_json::from_str::<JsonRpcMessage>(text) else {
-        return send_response(
-            &sender,
-            &crate::transport::stdio::parse_error_response("not a valid JSON-RPC request"),
-        )
-        .await;
-    };
-
-    // Captured before `message` moves into `call_message`, so a failure
-    // there can still answer with the id the client is waiting on (#1335).
-    let request_id = correlating_id(&message);
-
-    match service.call_message(message).await {
-        Ok(response) => send_response(&sender, &response).await?,
-        Err(e) => {
-            tracing::error!(error = %e, "Error processing message");
-            // `e` here is a transport or serialization failure rather than a
-            // caught tool panic, so it carries no tool name and no panic
-            // payload. The operator's disclosure choice still governs what
-            // reaches the client, which is what the router helper applies
-            // (#1354).
-            let error_response =
-                JsonRpcResponse::error(request_id, router.transport_internal_error(&e));
-            let _ = send_response(&sender, &error_response).await;
+    if let Some(notification) = notification {
+        match McpNotification::from_jsonrpc(&notification) {
+            Ok(notification) => router.handle_notification(notification),
+            Err(error) => tracing::error!(%error, "Error handling incoming notification"),
         }
     }
-
-    Ok(())
 }
 
 /// Handle a response to one of our pending requests
@@ -1256,7 +1411,7 @@ async fn send_outgoing_request<S>(
     outgoing: OutgoingRequest,
     pending_requests: &PendingClientRequests,
     abandon_tx: AbandonSender,
-    sender: Arc<Mutex<S>>,
+    sender: &mut S,
 ) -> Result<()>
 where
     S: futures::Sink<Message> + Unpin,
@@ -1290,7 +1445,6 @@ where
     }
 
     // Send the request
-    let mut sender = sender.lock().await;
     if let Err(e) = sender.send(Message::Text(request_json.into())).await {
         let message = format!("Failed to send request: {e}");
         pending_requests.fail(std::slice::from_ref(&id), &message);
@@ -1360,9 +1514,519 @@ async fn process_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+    use serde_json::{Value, json};
+    use std::sync::OnceLock;
+    use tokio::sync::Notify;
+    use tokio::task::JoinHandle;
+    use tower::ServiceExt;
+
+    use crate::extract::{Context, RawArgs};
+    use crate::{CallToolResult, ToolBuilder};
+
+    struct MemorySocket {
+        input: UnboundedSender<Message>,
+        output: UnboundedReceiver<Message>,
+        server: JoinHandle<()>,
+        session: Arc<Session>,
+        connected_router: Arc<OnceLock<McpRouter>>,
+    }
+
+    impl MemorySocket {
+        fn new(router: McpRouter, factory: ServiceFactory) -> Self {
+            Self::with_writer(router, factory, |sender| sender)
+        }
+
+        fn with_writer<S>(
+            router: McpRouter,
+            factory: ServiceFactory,
+            wrap: impl FnOnce(UnboundedSender<Message>) -> S,
+        ) -> Self
+        where
+            S: Sink<Message> + Unpin + Send + 'static,
+            S::Error: std::fmt::Display + Send,
+        {
+            let (input, receiver) = unbounded();
+            let (sender, output) = unbounded();
+            let sender = wrap(sender);
+            let connected_router = Arc::new(OnceLock::new());
+            let capture = connected_router.clone();
+            let factory: ServiceFactory = Arc::new(move |router| {
+                capture.get_or_init(|| router.clone());
+                factory(router)
+            });
+            let session = Arc::new(Session::new(router, factory));
+            let connection_session = session.clone();
+            let server = tokio::spawn(async move {
+                let cancel_rx = connection_session.cancel_receiver().await;
+                let id = connection_session.id.clone();
+                handle_socket_bidirectional(
+                    (sender, receiver.map(Ok::<_, std::convert::Infallible>)),
+                    connection_session,
+                    &id,
+                    crate::router::Extensions::new(),
+                    ProtocolSupport::default(),
+                    cancel_rx,
+                )
+                .await;
+            });
+            Self {
+                input,
+                output,
+                server,
+                session,
+                connected_router,
+            }
+        }
+
+        fn send(&self, frame: Value) {
+            self.send_frame(Message::Text(frame.to_string().into()));
+        }
+
+        fn send_frame(&self, frame: Message) {
+            self.input.unbounded_send(frame).unwrap();
+        }
+
+        async fn wait_closed(&mut self) {
+            tokio::time::timeout(Duration::from_secs(2), &mut self.server)
+                .await
+                .expect("server stops")
+                .expect("server task completes");
+        }
+
+        async fn next(&mut self) -> Message {
+            tokio::time::timeout(Duration::from_secs(2), self.output.next())
+                .await
+                .expect("a frame is written")
+                .expect("socket is open")
+        }
+
+        async fn response(&mut self) -> Value {
+            let Message::Text(text) = self.next().await else {
+                panic!("expected a text frame");
+            };
+            serde_json::from_str(&text).unwrap()
+        }
+
+        fn initialize(&self, version: &str) {
+            self.send(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": version, "capabilities": {"sampling": {}},
+                    "clientInfo": {"name": "test", "version": "0"}
+                }
+            }));
+            self.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        }
+
+        fn call(&self, id: u64, name: &str) {
+            self.send(json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": name, "arguments": {}}
+            }));
+        }
+    }
+
+    #[derive(Default)]
+    struct DispatchGate {
+        entered: Notify,
+        release: Notify,
+    }
+
+    fn gate_requests(gates: impl IntoIterator<Item = (i64, Arc<DispatchGate>)>) -> ServiceFactory {
+        let gates: HashMap<_, _> = gates
+            .into_iter()
+            .map(|(id, gate)| (RequestId::Number(id), gate))
+            .collect();
+        Arc::new(move |router| {
+            let gates = gates.clone();
+            McpBoxService::new(tower::service_fn(move |request: RouterRequest| {
+                let gate = gates.get(&request.id).cloned();
+                let router = router.clone();
+                async move {
+                    if let Some(gate) = gate {
+                        gate.entered.notify_one();
+                        gate.release.notified().await;
+                    }
+                    router.oneshot(request).await
+                }
+            }))
+        })
+    }
+
+    async fn wait_for(signal: &Notify) {
+        tokio::time::timeout(Duration::from_secs(2), signal.notified())
+            .await
+            .expect("signal arrives");
+    }
 
     fn create_test_router() -> McpRouter {
         McpRouter::new().server_info("test-server", "1.0.0")
+    }
+
+    #[tokio::test]
+    async fn direct_sampling_can_receive_its_answer_before_the_tool_returns() {
+        use crate::protocol::{CreateMessageParams, SamplingMessage};
+
+        let sample = ToolBuilder::new("sample")
+            .description("Await a sample from the client")
+            .extractor_handler((), |ctx: Context, RawArgs(_): RawArgs| async move {
+                let params = CreateMessageParams::new(vec![SamplingMessage::user("hello")], 10);
+                let answer = ctx.sample(params).await?;
+                Ok(CallToolResult::text(answer.model))
+            })
+            .build();
+        let mut socket = MemorySocket::new(create_test_router().tool(sample), identity_factory());
+        socket.initialize("2025-11-25");
+        assert_eq!(socket.response().await["id"], 1);
+        socket.call(2, "sample");
+        let outgoing = socket.response().await;
+        assert_eq!(outgoing["method"], "sampling/createMessage");
+        socket.send(json!({
+            "jsonrpc": "2.0", "id": outgoing["id"],
+            "result": {"role": "assistant", "content": {"type": "text", "text": "hi"}, "model": "test-model"}
+        }));
+
+        let response = socket.response().await;
+        assert_eq!(response["id"], 2);
+        assert_eq!(response["result"]["content"][0]["text"], "test-model");
+        socket.input.unbounded_send(Message::Close(None)).unwrap();
+        assert!(socket.output.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn initialize_fences_pipelined_requests_without_blocking_socket_control() {
+        let initialize = Arc::new(DispatchGate::default());
+        let earlier = Arc::new(DispatchGate::default());
+        let slower = Arc::new(DispatchGate::default());
+        let factory = gate_requests([
+            (1, initialize.clone()),
+            (2, earlier.clone()),
+            (3, slower.clone()),
+        ]);
+        let router = create_test_router();
+        let session = router.session().clone();
+        let mut socket = MemorySocket::new(router, factory);
+        socket.send(json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}));
+        socket.send(json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}));
+        wait_for(&earlier.entered).await;
+        wait_for(&slower.entered).await;
+        socket.initialize("2025-03-26");
+        wait_for(&initialize.entered).await;
+        socket.send(json!([{"jsonrpc": "2.0", "id": 4, "method": "ping"}]));
+
+        earlier.release.notify_one();
+        assert_eq!(socket.response().await["id"], 2);
+        socket.send_frame(Message::Ping(vec![1].into()));
+        assert_eq!(socket.next().await, Message::Pong(vec![1].into()));
+        initialize.release.notify_one();
+
+        let initialized = socket.response().await;
+        assert_eq!(initialized["id"], 1);
+        assert_eq!(initialized["result"]["protocolVersion"], "2025-03-26");
+        let batch = socket.response().await;
+        assert_eq!(batch[0]["id"], 4);
+        assert_eq!(batch[0]["result"], json!({}));
+        assert!(session.is_initialized());
+        slower.release.notify_one();
+        assert_eq!(socket.response().await["id"], 3);
+    }
+
+    #[tokio::test]
+    async fn cancel_before_dispatch_omits_only_the_named_batch_member() {
+        let router = create_test_router().with_connection_in_flight();
+        let connection = CancellationToken::new();
+        let support = ProtocolSupport::try_new(["2025-03-26"]).unwrap();
+        let service =
+            JsonRpcService::new((identity_factory())(router.clone())).protocol_support(support);
+        let pending = PendingClientRequests::new();
+        let receive =
+            |text| handle_incoming_message(text, &service, &router, &pending, &connection);
+        let Some(Incoming::Request(request)) = receive(
+            r#"[{"jsonrpc":"2.0","id":2,"method":"ping"},{"jsonrpc":"2.0","id":3,"method":"ping"}]"#,
+        )
+        .unwrap() else {
+            panic!("expected a request");
+        };
+        assert!(
+            receive(
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}"#,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let mut in_flight = JoinSet::new();
+        assert!(matches!(
+            request.dispatch(&service, &mut in_flight),
+            Dispatch::Spawned { .. }
+        ));
+        let response = in_flight
+            .join_next()
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let response = serde_json::to_value(response).unwrap();
+        assert_eq!(response, json!([{"jsonrpc": "2.0", "id": 3, "result": {}}]));
+    }
+
+    #[tokio::test]
+    async fn panicking_tool_gets_a_correlated_internal_error() {
+        async fn panic_in_handler(_: RawArgs) -> Result<CallToolResult> {
+            panic!("private handler panic");
+        }
+
+        let panics = ToolBuilder::new("panics")
+            .description("Panic inside a tracked dispatch")
+            .extractor_handler((), panic_in_handler)
+            .build();
+        let mut socket = MemorySocket::new(create_test_router().tool(panics), identity_factory());
+        socket.initialize("2025-11-25");
+        assert_eq!(socket.response().await["id"], 1);
+        socket.call(2, "panics");
+        let reply = socket.response().await;
+        assert_eq!(reply["id"], 2);
+        assert_eq!(reply["error"]["code"], -32603);
+        assert_eq!(reply["error"]["message"], "Request dispatch task panicked");
+
+        socket.send(json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}));
+        assert_eq!(
+            socket.response().await,
+            json!({"jsonrpc": "2.0", "id": 3, "result": {}})
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn back_to_back_cancel_frames_leave_the_queued_request_unanswered() {
+        let initialize = Arc::new(DispatchGate::default());
+        let factory = gate_requests([(1, initialize.clone())]);
+        let mut socket = MemorySocket::new(create_test_router(), factory);
+        socket.initialize("2025-11-25");
+        wait_for(&initialize.entered).await;
+        socket.send(json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}));
+        socket.send(json!({
+            "jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 2}
+        }));
+        socket.send_frame(Message::Ping(vec![1].into()));
+        assert_eq!(socket.next().await, Message::Pong(vec![1].into()));
+
+        initialize.release.notify_one();
+        assert_eq!(socket.response().await["id"], 1);
+        socket.send(json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}));
+        assert_eq!(socket.response().await["id"], 3);
+        // Paused time advances once runnable tasks have had a chance to write.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), socket.output.next())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn replacing_the_connection_sends_close_and_cancels_the_handler() {
+        let entered = Arc::new(Notify::new());
+        let cancelled = Arc::new(Notify::new());
+        let wait = ToolBuilder::new("wait")
+            .description("Wait for connection cancellation")
+            .extractor_handler((), {
+                let (entered, cancelled) = (entered.clone(), cancelled.clone());
+                move |ctx: Context| {
+                    let (entered, cancelled) = (entered.clone(), cancelled.clone());
+                    async move {
+                        entered.notify_one();
+                        ctx.cancelled().await;
+                        cancelled.notify_one();
+                        Ok(CallToolResult::text("cancelled"))
+                    }
+                }
+            })
+            .build();
+        let mut socket = MemorySocket::new(create_test_router().tool(wait), identity_factory());
+        socket.initialize("2025-11-25");
+        assert_eq!(socket.response().await["id"], 1);
+        socket.call(2, "wait");
+        wait_for(&entered).await;
+
+        let replacement = socket.session.replace_connection().await;
+        let Message::Close(Some(close)) = socket.next().await else {
+            panic!("expected a close frame");
+        };
+        assert_eq!(close.code, 1000);
+        assert!(!*replacement.borrow());
+        wait_for(&cancelled).await;
+        socket.wait_closed().await;
+        assert!(socket.output.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn disconnect_releases_a_full_outgoing_queue() {
+        let writer_entered = Arc::new(Notify::new());
+        let disconnect = Arc::new(Notify::new());
+        let fill = Arc::new(Notify::new());
+        let full = Arc::new(Notify::new());
+        let (result_tx, mut results) = tokio::sync::mpsc::unbounded_channel();
+        let flood = ToolBuilder::new("flood")
+            .description("Fill the outgoing request queue")
+            .extractor_handler((), {
+                let fill = fill.clone();
+                let full = full.clone();
+                move |ctx: Context, RawArgs(_): RawArgs| {
+                    let (fill, full, result_tx) = (fill.clone(), full.clone(), result_tx.clone());
+                    async move {
+                        fill.notified().await;
+                        let mut requests: Vec<_> = (0..=OUTGOING_REQUEST_CAPACITY)
+                            .map(|_| Box::pin(ctx.request_raw("ping", json!({}))))
+                            .collect();
+                        for request in &mut requests {
+                            assert!(futures::poll!(request.as_mut()).is_pending());
+                        }
+                        full.notify_one();
+                        result_tx
+                            .send(futures::future::join_all(requests).await)
+                            .unwrap();
+                        Ok(CallToolResult::text("released"))
+                    }
+                }
+            })
+            .build();
+        let mut socket = MemorySocket::with_writer(
+            create_test_router().tool(flood),
+            identity_factory(),
+            |sender| {
+                Box::pin(sender.sink_map_err(|_| "receiver closed").with({
+                    let writer_entered = writer_entered.clone();
+                    let disconnect = disconnect.clone();
+                    move |frame| {
+                        let (writer_entered, disconnect) =
+                            (writer_entered.clone(), disconnect.clone());
+                        async move {
+                            if matches!(frame, Message::Pong(_)) {
+                                writer_entered.notify_one();
+                                disconnect.notified().await;
+                                return Err("connection reset");
+                            }
+                            Ok(frame)
+                        }
+                    }
+                }))
+            },
+        );
+        socket.initialize("2025-11-25");
+        assert_eq!(socket.response().await["id"], 1);
+        socket.call(2, "flood");
+        // Block a write so the socket loop cannot take any outgoing requests.
+        socket.send_frame(Message::Ping(vec![1].into()));
+        wait_for(&writer_entered).await;
+        fill.notify_one();
+        wait_for(&full).await;
+        disconnect.notify_one();
+
+        let results = tokio::time::timeout(Duration::from_secs(2), results.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        for result in &results[..OUTGOING_REQUEST_CAPACITY] {
+            assert!(
+                matches!(result, Err(Error::Internal(message)) if message == "Failed to receive response: channel closed")
+            );
+        }
+        assert!(
+            matches!(&results[OUTGOING_REQUEST_CAPACITY], Err(Error::Internal(message)) if message == "Failed to send request: channel closed")
+        );
+        socket.wait_closed().await;
+        assert!(socket.output.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closing_the_socket_untracks_active_and_queued_request_ids() {
+        let initialize = Arc::new(DispatchGate::default());
+        let earlier = Arc::new(DispatchGate::default());
+        let factory = gate_requests([(1, initialize.clone()), (2, earlier.clone())]);
+        let mut socket = MemorySocket::new(create_test_router(), factory);
+        socket.send(json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}));
+        wait_for(&earlier.entered).await;
+        socket.initialize("2025-11-25");
+        wait_for(&initialize.entered).await;
+        socket.send(json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}));
+        socket.send_frame(Message::Ping(vec![1].into()));
+        assert_eq!(socket.next().await, Message::Pong(vec![1].into()));
+
+        let router = socket.connected_router.get().unwrap().clone();
+        assert_eq!(router.in_flight_request_count(), 2);
+        socket.send_frame(Message::Close(None));
+        socket.wait_closed().await;
+        assert_eq!(router.in_flight_request_count(), 0);
+        assert!(socket.output.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_releases_pending_waiters_and_aborts_after_cancellation_grace() {
+        struct SignalOnDrop(Arc<Notify>);
+
+        impl Drop for SignalOnDrop {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+
+        let started = Arc::new(Notify::new());
+        let dropped = Arc::new(Notify::new());
+        let stuck = ToolBuilder::new("stuck")
+            .description("Ignore cancellation until the task is dropped")
+            .extractor_handler((), {
+                let started = started.clone();
+                let dropped = dropped.clone();
+                move |RawArgs(_): RawArgs| {
+                    let started = started.clone();
+                    let dropped = dropped.clone();
+                    async move {
+                        let _on_drop = SignalOnDrop(dropped);
+                        started.notify_one();
+                        std::future::pending::<crate::error::Result<CallToolResult>>().await
+                    }
+                }
+            })
+            .build();
+        let (observed, mut cancelled) = tokio::sync::mpsc::unbounded_channel();
+        let wait = ToolBuilder::new("wait")
+            .description("Wait for the peer or connection failure")
+            .extractor_handler((), move |ctx: Context, RawArgs(_): RawArgs| {
+                let observed = observed.clone();
+                async move {
+                    let result = ctx.request_raw("ping", json!({})).await;
+                    observed
+                        .send((ctx.is_cancelled(), result.is_err()))
+                        .unwrap();
+                    Ok(CallToolResult::text("released"))
+                }
+            })
+            .build();
+        let router = create_test_router().tool(stuck).tool(wait);
+        let mut socket = MemorySocket::new(router, identity_factory());
+        socket.initialize("2025-11-25");
+        assert_eq!(socket.response().await["id"], 1);
+        socket.call(2, "stuck");
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        socket.call(3, "wait");
+        assert_eq!(socket.response().await["method"], "ping");
+        socket.input.unbounded_send(Message::Close(None)).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), cancelled.recv())
+                .await
+                .unwrap(),
+            Some((true, true))
+        );
+        assert!(!socket.server.is_finished());
+        tokio::time::advance(CANCEL_GRACE).await;
+        socket.wait_closed().await;
+        tokio::time::timeout(Duration::from_secs(2), dropped.notified())
+            .await
+            .unwrap();
+        assert!(socket.output.next().await.is_none());
     }
 
     /// A sink whose every write fails, like a socket that has gone away.
@@ -1415,13 +2079,7 @@ mod tests {
             response_tx,
         };
 
-        let result = send_outgoing_request(
-            outgoing,
-            &pending,
-            abandon_tx,
-            Arc::new(Mutex::new(BrokenSink)),
-        )
-        .await;
+        let result = send_outgoing_request(outgoing, &pending, abandon_tx, &mut BrokenSink).await;
 
         assert!(matches!(result, Err(Error::Transport(_))), "{result:?}");
         let delivered = response_rx.await.expect("the waiter is answered");
@@ -1446,7 +2104,7 @@ mod tests {
     #[tokio::test]
     async fn client_reply_on_the_receive_path_completes_the_request() {
         let router = create_test_router();
-        let mut service = JsonRpcService::new((identity_factory())(router.clone()));
+        let service = JsonRpcService::new((identity_factory())(router.clone()));
         let pending = PendingClientRequests::new();
         let (abandon_tx, mut abandon_rx) = abandon_channel();
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -1458,15 +2116,15 @@ mod tests {
             "result": {"role": "assistant", "content": {"type": "text", "text": "hi"}, "model": "m"}
         })
         .to_string();
-        handle_incoming_message(
+        let input = handle_incoming_message(
             &reply,
-            &mut service,
+            &service,
             &router,
             &pending,
-            Arc::new(Mutex::new(BrokenSink)),
+            &CancellationToken::new(),
         )
-        .await
         .expect("a reply needs no write");
+        assert!(input.is_none());
 
         let delivered = response_rx.await.unwrap().expect("delivered as a result");
         assert_eq!(delivered["model"], "m");
