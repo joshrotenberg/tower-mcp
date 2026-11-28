@@ -825,38 +825,42 @@ impl HttpClientTransport {
             .collect()
     }
 
+    fn capture_initialize_reply(&mut self, parsed: &serde_json::Value) -> bool {
+        let Some(expected) = self.initialize_request_id.as_ref() else {
+            return false;
+        };
+        if self.initialize_reply_seen
+            || parsed.get("method").is_some()
+            || (parsed.get("result").is_none() && parsed.get("error").is_none())
+            || !super::parse_request_id(parsed)
+                .is_some_and(|actual| super::request_ids_match(&actual, expected))
+        {
+            return false;
+        }
+
+        self.initialize_reply_seen = true;
+        if parsed.get("error").is_none()
+            && let Some(version) = parsed
+                .pointer("/result/protocolVersion")
+                .and_then(serde_json::Value::as_str)
+            && super::accepts_initialize_answer(&crate::ProtocolSupport::stable(), version)
+        {
+            self.protocol_version.send_replace(Some(version.to_owned()));
+            self.initialize_version_negotiated = true;
+        }
+        true
+    }
+
     fn normalize_incoming_message(&mut self, message: String) -> String {
-        let pending_initialize = self
-            .initialize_request_id
-            .as_ref()
-            .filter(|_| !self.initialize_reply_seen);
         let is_modern = self.protocol_version.borrow().as_deref()
             == Some(crate::protocol::PROTOCOL_VERSION_2026_07_28);
-        if pending_initialize.is_none() && !is_modern {
+        if !is_modern && (self.initialize_request_id.is_none() || self.initialize_reply_seen) {
             return message;
         }
         let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&message) else {
             return message;
         };
-        if let Some(expected) = pending_initialize
-            && parsed.get("method").is_none()
-            && (parsed.get("result").is_some() || parsed.get("error").is_some())
-            && super::parse_request_id(&parsed)
-                .is_some_and(|actual| super::request_ids_match(&actual, expected))
-        {
-            self.initialize_reply_seen = true;
-            if parsed.get("error").is_none()
-                && let Some(version) = parsed
-                    .pointer("/result/protocolVersion")
-                    .and_then(serde_json::Value::as_str)
-                && super::accepts_initialize_answer(&crate::ProtocolSupport::stable(), version)
-            {
-                self.protocol_version.send_replace(Some(version.to_owned()));
-                self.initialize_version_negotiated = true;
-            }
-            return message;
-        }
-        if !is_modern {
+        if self.capture_initialize_reply(&parsed) || !is_modern {
             return message;
         }
         // The server says the tool set changed, so every learned mapping is
@@ -1924,14 +1928,19 @@ impl ClientTransport for HttpClientTransport {
         if let Some(pv) = new_protocol_version {
             self.protocol_version.send_replace(Some(pv));
         }
-        if !is_modern_request && let Some(sid) = new_session_id {
-            let is_new_session = self.session_id.is_none();
+        let start_listener = if !is_modern_request && let Some(sid) = new_session_id {
+            let start_listener = self.session_id.is_none() && self.config.auto_sse;
             self.session_id = Some(sid);
+            start_listener
+        } else {
+            false
+        };
 
-            // An initialize reply may still be streaming when the listener starts.
-            if is_new_session && self.config.auto_sse {
-                self.start_sse_stream();
-            }
+        let streamed_response = response_is_sse(&response);
+        let buffered_initialize = method == Some("initialize") && !streamed_response;
+        // A streamed initialize can depend on the listener opening its GET.
+        if start_listener && !buffered_initialize {
+            self.start_sse_stream();
         }
 
         // A request answered with an SSE stream is read on its own task, as on
@@ -1939,7 +1948,7 @@ impl ClientTransport for HttpClientTransport {
         // request on that stream (`initialize` answered by a ping, say) and
         // hold the final reply until it is answered, and the message loop
         // that answers it is the caller of this method (#1558).
-        if response_is_sse(&response) && reply_id.is_some() {
+        if streamed_response && reply_id.is_some() {
             let request_id = reply_id
                 .clone()
                 .and_then(|value| serde_json::from_value(value).ok());
@@ -1987,6 +1996,18 @@ impl ClientTransport for HttpClientTransport {
         };
 
         let msgs = extract_json_messages(&body);
+        if buffered_initialize {
+            for msg in &msgs {
+                if let Ok(parsed) = serde_json::from_str(msg)
+                    && self.capture_initialize_reply(&parsed)
+                {
+                    break;
+                }
+            }
+            if start_listener {
+                self.start_sse_stream();
+            }
+        }
         let answered = reply_id
             .as_ref()
             .is_none_or(|id| frames_answer_request(&msgs, id));
@@ -2025,9 +2046,8 @@ impl ClientTransport for HttpClientTransport {
             self.incoming_rx.recv().await
         };
         match message {
-            // All response paths converge here. Capture the initialize
-            // version and normalize tools/list on the transport-owning task
-            // so the next outgoing message can use the learned headers.
+            // Capture streamed initialize replies and normalize tools/list
+            // on the transport-owning task before delivering the frame.
             Some(msg) => Ok(Some(self.normalize_incoming_message(msg))),
             None => {
                 self.connected.store(false, Ordering::Release);
@@ -5741,10 +5761,18 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            first_get.as_deref() == response_version || first_get.as_deref() == Some(version),
-            "the initial SSE GET uses the version available at startup: {first_get:?}"
-        );
+        if initialize_as_sse {
+            assert!(
+                first_get.as_deref() == response_version || first_get.as_deref() == Some(version),
+                "the initial SSE GET uses the version available at startup: {first_get:?}"
+            );
+        } else {
+            assert_eq!(
+                first_get.as_deref(),
+                Some(version),
+                "the initial SSE GET uses the version from the buffered reply"
+            );
+        }
         client.shutdown().await.unwrap();
         assert_eq!(
             tokio::time::timeout(LEGACY_PROTOCOL_WAIT, observed_rx.recv())
@@ -5752,6 +5780,11 @@ mod tests {
                 .unwrap(),
             Some(Some(version.to_owned())),
             "the session DELETE uses the negotiated version"
+        );
+        assert_eq!(
+            observed_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty),
+            "only one listener GET was sent"
         );
         server.abort();
     }
@@ -5780,6 +5813,7 @@ mod tests {
             .send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
             .await
             .unwrap();
+        assert!(transport.initialize_reply_seen);
         let frame = tokio::time::timeout(LEGACY_PROTOCOL_WAIT, transport.recv())
             .await
             .unwrap()
@@ -5787,7 +5821,6 @@ mod tests {
             .unwrap();
         let reply: serde_json::Value = serde_json::from_str(&frame).unwrap();
         assert!(reply["result"].get("protocolVersion").is_none());
-        assert!(transport.initialize_reply_seen);
         assert!(!transport.initialize_version_negotiated);
         assert_eq!(
             transport.protocol_version.borrow().as_deref(),
