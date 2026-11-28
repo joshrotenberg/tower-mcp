@@ -54,7 +54,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine;
-use tokio::sync::{Notify, RwLock, mpsc};
+use tokio::sync::{Notify, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use super::transport::ClientTransport;
@@ -464,8 +464,8 @@ pub struct HttpClientTransport {
     client: reqwest::Client,
     /// Session ID received from the server after `initialize`.
     session_id: Option<String>,
-    /// Negotiated protocol version.
-    protocol_version: Option<String>,
+    /// Current protocol version, shared with the SSE listener for reconnects.
+    protocol_version: watch::Sender<Option<String>>,
     /// Validated custom-header mappings learned from `tools/list`. Replaced
     /// by a first-page response and extended by later pages.
     tool_header_mappings: HashMap<String, Vec<CustomHeaderMapping>>,
@@ -491,6 +491,10 @@ pub struct HttpClientTransport {
     request_tasks: HashMap<RequestId, JoinHandle<()>>,
     /// The id of the `initialize` request, which the spec forbids cancelling.
     initialize_request_id: Option<RequestId>,
+    /// A result or error for the initialize request has arrived.
+    initialize_reply_seen: bool,
+    /// The initialize reply supplied the protocol version for this session.
+    initialize_version_negotiated: bool,
     /// The last SSE event ID received, for stream resumption.
     last_event_id: Arc<RwLock<Option<String>>>,
     /// Server-requested retry delay from SSE `retry:` field.
@@ -547,7 +551,7 @@ impl HttpClientTransport {
             url: url.into(),
             client: build_client(config.follow_cross_origin_redirects),
             session_id: None,
-            protocol_version: None,
+            protocol_version: watch::Sender::new(None),
             tool_header_mappings: HashMap::new(),
             pending_tools_lists: Vec::new(),
             incoming_rx: rx,
@@ -556,6 +560,8 @@ impl HttpClientTransport {
             replacing_expired_listener: false,
             request_tasks: HashMap::new(),
             initialize_request_id: None,
+            initialize_reply_seen: false,
+            initialize_version_negotiated: false,
             last_event_id: Arc::new(RwLock::new(None)),
             sse_retry_delay: Arc::new(RwLock::new(None)),
             sse_reconnect_signal: Arc::new(Notify::new()),
@@ -591,7 +597,7 @@ impl HttpClientTransport {
             url: url.into(),
             client,
             session_id: None,
-            protocol_version: None,
+            protocol_version: watch::Sender::new(None),
             tool_header_mappings: HashMap::new(),
             pending_tools_lists: Vec::new(),
             incoming_rx: rx,
@@ -600,6 +606,8 @@ impl HttpClientTransport {
             replacing_expired_listener: false,
             request_tasks: HashMap::new(),
             initialize_request_id: None,
+            initialize_reply_seen: false,
+            initialize_version_negotiated: false,
             last_event_id: Arc::new(RwLock::new(None)),
             sse_retry_delay: Arc::new(RwLock::new(None)),
             sse_reconnect_signal: Arc::new(Notify::new()),
@@ -817,13 +825,44 @@ impl HttpClientTransport {
             .collect()
     }
 
+    fn capture_initialize_reply(&mut self, parsed: &serde_json::Value) -> bool {
+        let Some(expected) = self.initialize_request_id.as_ref() else {
+            return false;
+        };
+        if self.initialize_reply_seen
+            || parsed.get("method").is_some()
+            || (parsed.get("result").is_none() && parsed.get("error").is_none())
+            || !super::parse_request_id(parsed)
+                .is_some_and(|actual| super::request_ids_match(&actual, expected))
+        {
+            return false;
+        }
+
+        self.initialize_reply_seen = true;
+        if parsed.get("error").is_none()
+            && let Some(version) = parsed
+                .pointer("/result/protocolVersion")
+                .and_then(serde_json::Value::as_str)
+            && super::accepts_initialize_answer(&crate::ProtocolSupport::stable(), version)
+        {
+            self.protocol_version.send_replace(Some(version.to_owned()));
+            self.initialize_version_negotiated = true;
+        }
+        true
+    }
+
     fn normalize_incoming_message(&mut self, message: String) -> String {
-        if self.protocol_version.as_deref() != Some(crate::protocol::PROTOCOL_VERSION_2026_07_28) {
+        let is_modern = self.protocol_version.borrow().as_deref()
+            == Some(crate::protocol::PROTOCOL_VERSION_2026_07_28);
+        if !is_modern && (self.initialize_request_id.is_none() || self.initialize_reply_seen) {
             return message;
         }
         let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&message) else {
             return message;
         };
+        if self.capture_initialize_reply(&parsed) || !is_modern {
+            return message;
+        }
         // The server says the tool set changed, so every learned mapping is
         // suspect. The client re-lists from the first page next.
         if parsed.get("method").and_then(serde_json::Value::as_str)
@@ -893,7 +932,7 @@ impl HttpClientTransport {
         let url = self.url.clone();
         let client = self.client.clone();
         let session_id = self.session_id.clone().unwrap();
-        let protocol_version = self.protocol_version.clone();
+        let protocol_version = self.protocol_version.subscribe();
         let tx = self.incoming_tx.clone();
         let last_event_id = self.last_event_id.clone();
         let sse_retry_delay = self.sse_retry_delay.clone();
@@ -1387,6 +1426,8 @@ impl ClientTransport for HttpClientTransport {
             self.initialize_request_id = reply_id
                 .clone()
                 .and_then(|value| serde_json::from_value(value).ok());
+            self.initialize_reply_seen = false;
+            self.initialize_version_negotiated = false;
         }
         let outbound_version = parsed_message
             .as_ref()
@@ -1398,12 +1439,17 @@ impl ClientTransport for HttpClientTransport {
         let is_modern_request =
             outbound_version.as_deref() == Some(crate::protocol::PROTOCOL_VERSION_2026_07_28);
         if is_modern_request {
-            self.protocol_version = outbound_version.clone();
+            self.initialize_request_id = None;
+            self.initialize_reply_seen = false;
+            self.initialize_version_negotiated = false;
             // Final requests are sessionless even when a transitional peer
             // incorrectly returns a legacy session header from discovery.
             self.session_id = None;
             if let Some(listener) = self.sse_task.take() {
                 listener.abort();
+                self.protocol_version = watch::Sender::new(outbound_version.clone());
+            } else {
+                self.protocol_version.send_replace(outbound_version.clone());
             }
         }
         if is_modern_request
@@ -1444,7 +1490,10 @@ impl ClientTransport for HttpClientTransport {
             request = request.header("mcp-session-id", session_id);
         }
 
-        if let Some(version) = outbound_version.as_ref().or(self.protocol_version.as_ref()) {
+        if let Some(version) = outbound_version
+            .as_ref()
+            .or(self.protocol_version.borrow().as_ref())
+        {
             request = request.header("mcp-protocol-version", version);
         }
 
@@ -1793,9 +1842,8 @@ impl ClientTransport for HttpClientTransport {
             return Ok(());
         }
 
-        // Pre-session (initialize) and notifications: handle synchronously.
-        // For initialize this extracts session headers and starts the SSE
-        // stream; for notifications the expected response is a bare 202.
+        // Handle initialize and notifications synchronously. Initialize
+        // extracts session headers, and notifications expect a bare 202.
         let response = send_http_request(
             request,
             &self.url,
@@ -1821,6 +1869,7 @@ impl ClientTransport for HttpClientTransport {
         let new_protocol_version = response
             .headers()
             .get("mcp-protocol-version")
+            .filter(|_| !self.initialize_version_negotiated)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
@@ -1831,7 +1880,7 @@ impl ClientTransport for HttpClientTransport {
                 self.session_id = Some(sid);
             }
             if let Some(pv) = new_protocol_version {
-                self.protocol_version = Some(pv);
+                self.protocol_version.send_replace(Some(pv));
             }
             // A request is owed a response; a 202 leaves its caller waiting.
             if let Some(id) = &reply_id {
@@ -1876,16 +1925,22 @@ impl ClientTransport for HttpClientTransport {
         }
 
         // Update session state
-        if !is_modern_request && let Some(sid) = new_session_id {
-            let is_new_session = self.session_id.is_none();
-            self.session_id = Some(sid);
-
-            if is_new_session && self.config.auto_sse {
-                self.start_sse_stream();
-            }
-        }
         if let Some(pv) = new_protocol_version {
-            self.protocol_version = Some(pv);
+            self.protocol_version.send_replace(Some(pv));
+        }
+        let start_listener = if !is_modern_request && let Some(sid) = new_session_id {
+            let start_listener = self.session_id.is_none() && self.config.auto_sse;
+            self.session_id = Some(sid);
+            start_listener
+        } else {
+            false
+        };
+
+        let streamed_response = response_is_sse(&response);
+        let buffered_initialize = method == Some("initialize") && !streamed_response;
+        // A streamed initialize can depend on the listener opening its GET.
+        if start_listener && !buffered_initialize {
+            self.start_sse_stream();
         }
 
         // A request answered with an SSE stream is read on its own task, as on
@@ -1893,7 +1948,7 @@ impl ClientTransport for HttpClientTransport {
         // request on that stream (`initialize` answered by a ping, say) and
         // hold the final reply until it is answered, and the message loop
         // that answers it is the caller of this method (#1558).
-        if response_is_sse(&response) && reply_id.is_some() {
+        if streamed_response && reply_id.is_some() {
             let request_id = reply_id
                 .clone()
                 .and_then(|value| serde_json::from_value(value).ok());
@@ -1941,6 +1996,18 @@ impl ClientTransport for HttpClientTransport {
         };
 
         let msgs = extract_json_messages(&body);
+        if buffered_initialize {
+            for msg in &msgs {
+                if let Ok(parsed) = serde_json::from_str(msg)
+                    && self.capture_initialize_reply(&parsed)
+                {
+                    break;
+                }
+            }
+            if start_listener {
+                self.start_sse_stream();
+            }
+        }
         let answered = reply_id
             .as_ref()
             .is_none_or(|id| frames_answer_request(&msgs, id));
@@ -1979,10 +2046,8 @@ impl ClientTransport for HttpClientTransport {
             self.incoming_rx.recv().await
         };
         match message {
-            // All response paths converge here, including background final
-            // POSTs. Normalize tools/list results on the transport-owning
-            // task so validated x-mcp-header mappings are available to the
-            // next tools/call without sharing mutable state across tasks.
+            // Capture streamed initialize replies and normalize tools/list
+            // on the transport-owning task before delivering the frame.
             Some(msg) => Ok(Some(self.normalize_incoming_message(msg))),
             None => {
                 self.connected.store(false, Ordering::Release);
@@ -2011,10 +2076,12 @@ impl ClientTransport for HttpClientTransport {
         // `session_id` up front, regardless of outcome, is what makes `Drop`
         // a no-op if it runs afterward.
         if let Some(session_id) = self.session_id.take() {
+            let protocol_version = self.protocol_version.borrow().clone();
             send_session_delete(SessionDeleteParams {
                 client: self.client.clone(),
                 url: self.url.clone(),
                 session_id,
+                protocol_version,
                 headers: self.config.headers.clone(),
                 #[cfg(feature = "oauth-client")]
                 token_provider: self.token_provider.clone(),
@@ -2039,7 +2106,10 @@ impl ClientTransport for HttpClientTransport {
 
         // Clear session state but keep the transport alive
         self.session_id = None;
-        self.protocol_version = None;
+        self.protocol_version = watch::Sender::new(None);
+        self.initialize_request_id = None;
+        self.initialize_reply_seen = false;
+        self.initialize_version_negotiated = false;
         // Isolate the new session even from a send that raced task abortion.
         // Replies to server-initiated requests have no client request task:
         // a late failure of one must not mark the replacement disconnected.
@@ -2052,10 +2122,12 @@ impl ClientTransport for HttpClientTransport {
 
     async fn end_session(&mut self) {
         if let Some(session_id) = self.session_id.clone() {
+            let protocol_version = self.protocol_version.borrow().clone();
             send_session_delete(SessionDeleteParams {
                 client: self.client.clone(),
                 url: self.url.clone(),
                 session_id,
+                protocol_version,
                 headers: self.config.headers.clone(),
                 #[cfg(feature = "oauth-client")]
                 token_provider: self.token_provider.clone(),
@@ -2138,6 +2210,7 @@ impl Drop for HttpClientTransport {
             client: self.client.clone(),
             url: self.url.clone(),
             session_id,
+            protocol_version: self.protocol_version.borrow().clone(),
             headers: self.config.headers.clone(),
             #[cfg(feature = "oauth-client")]
             token_provider: self.token_provider.clone(),
@@ -2355,6 +2428,7 @@ struct SessionDeleteParams {
     client: reqwest::Client,
     url: String,
     session_id: String,
+    protocol_version: Option<String>,
     headers: HashMap<String, String>,
     #[cfg(feature = "oauth-client")]
     token_provider: Option<Arc<dyn TokenProvider>>,
@@ -2368,6 +2442,7 @@ async fn send_session_delete(params: SessionDeleteParams) {
         client,
         url,
         session_id,
+        protocol_version,
         headers,
         #[cfg(feature = "oauth-client")]
         token_provider,
@@ -2377,6 +2452,10 @@ async fn send_session_delete(params: SessionDeleteParams) {
         .delete(&url)
         .header("mcp-session-id", &session_id)
         .timeout(SESSION_DELETE_TIMEOUT);
+
+    if let Some(version) = protocol_version {
+        request = request.header("mcp-protocol-version", version);
+    }
 
     for (key, value) in &headers {
         request = request.header(key.as_str(), value.as_str());
@@ -2404,7 +2483,7 @@ struct SseLoopParams {
     client: reqwest::Client,
     session_id: String,
     replacement: bool,
-    protocol_version: Option<String>,
+    protocol_version: watch::Receiver<Option<String>>,
     tx: mpsc::Sender<String>,
     last_event_id: Arc<RwLock<Option<String>>>,
     sse_retry_delay: Arc<RwLock<Option<Duration>>>,
@@ -2448,7 +2527,8 @@ async fn sse_stream_loop(params: SseLoopParams) -> Result<()> {
             .header("Accept", "text/event-stream")
             .header("mcp-session-id", &session_id);
 
-        if let Some(ref version) = protocol_version {
+        // Reconnects can use a version learned after the initial GET.
+        if let Some(ref version) = *protocol_version.borrow() {
             request = request.header("mcp-protocol-version", version);
         }
 
@@ -3492,7 +3572,9 @@ mod tests {
     fn drop_outside_a_runtime_does_not_panic() {
         let mut transport = HttpClientTransport::new("http://127.0.0.1:1");
         transport.session_id = Some("session-outside-runtime".to_string());
-        transport.protocol_version = Some(crate::protocol::LATEST_PROTOCOL_VERSION.to_string());
+        transport
+            .protocol_version
+            .send_replace(Some(crate::protocol::LATEST_PROTOCOL_VERSION.to_string()));
         drop(transport);
     }
 
@@ -3845,7 +3927,7 @@ mod tests {
         let transport = HttpClientTransport::new("http://localhost:3000");
         assert_eq!(transport.url, "http://localhost:3000");
         assert!(transport.session_id.is_none());
-        assert!(transport.protocol_version.is_none());
+        assert!(transport.protocol_version.borrow().is_none());
         assert!(transport.is_connected());
     }
 
@@ -4074,7 +4156,9 @@ mod tests {
     #[test]
     fn sep_2243_filters_invalid_tools_and_caches_valid_mappings() {
         let mut transport = HttpClientTransport::new("http://localhost:3000");
-        transport.protocol_version = Some(crate::protocol::PROTOCOL_VERSION_2026_07_28.to_string());
+        transport.protocol_version.send_replace(Some(
+            crate::protocol::PROTOCOL_VERSION_2026_07_28.to_string(),
+        ));
         let normalized = transport.normalize_incoming_message(
             serde_json::json!({
                 "jsonrpc": "2.0",
@@ -4275,7 +4359,9 @@ mod tests {
     #[test]
     fn sep_2243_normalization_keeps_tool_with_annotation_lookalikes() {
         let mut transport = HttpClientTransport::new("http://localhost:3000");
-        transport.protocol_version = Some(crate::protocol::PROTOCOL_VERSION_2026_07_28.to_string());
+        transport.protocol_version.send_replace(Some(
+            crate::protocol::PROTOCOL_VERSION_2026_07_28.to_string(),
+        ));
         let normalized = transport.normalize_incoming_message(
             serde_json::json!({
                 "jsonrpc": "2.0",
@@ -4347,7 +4433,9 @@ mod tests {
     #[test]
     fn tools_list_pages_merge_header_mappings_until_list_changed() {
         let mut transport = HttpClientTransport::new("http://localhost:3000");
-        transport.protocol_version = Some(crate::protocol::PROTOCOL_VERSION_2026_07_28.to_string());
+        transport.protocol_version.send_replace(Some(
+            crate::protocol::PROTOCOL_VERSION_2026_07_28.to_string(),
+        ));
 
         transport
             .pending_tools_lists
@@ -4391,7 +4479,9 @@ mod tests {
     #[test]
     fn tools_list_error_response_clears_pending_entry() {
         let mut transport = HttpClientTransport::new("http://localhost:3000");
-        transport.protocol_version = Some(crate::protocol::PROTOCOL_VERSION_2026_07_28.to_string());
+        transport.protocol_version.send_replace(Some(
+            crate::protocol::PROTOCOL_VERSION_2026_07_28.to_string(),
+        ));
         transport
             .pending_tools_lists
             .push((serde_json::json!(7), true));
@@ -4595,7 +4685,7 @@ mod tests {
         }
 
         /// Read one HTTP/1.1 request; return its head and body.
-        async fn read_request(stream: &mut TcpStream) -> Option<(String, String)> {
+        pub(super) async fn read_request(stream: &mut TcpStream) -> Option<(String, String)> {
             let mut buf = Vec::new();
             let mut chunk = [0u8; 4096];
             loop {
@@ -5553,6 +5643,317 @@ mod tests {
             assert_eq!(frame["error"]["code"], -32005);
             assert_eq!(frame["error"]["message"], "server sentinel");
         }
+    }
+
+    const LEGACY_PROTOCOL_WAIT: Duration = Duration::from_secs(5);
+
+    async fn legacy_protocol_server(
+        body_version: Option<&'static str>,
+        initialize_as_sse: bool,
+        response_version: Option<&'static str>,
+    ) -> (
+        HttpClientTransport,
+        mpsc::Receiver<Option<String>>,
+        JoinHandle<()>,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let version = body_version.or(response_version).unwrap();
+        let response_version_header = response_version
+            .map(|version| format!("mcp-protocol-version: {version}\r\n"))
+            .unwrap_or_default();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (observed_tx, observed_rx) = mpsc::channel(2);
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let (head, body) = request_failure_scope::read_request(&mut stream)
+                    .await
+                    .unwrap();
+                let protocol_header = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("mcp-protocol-version:"))
+                    .map(|value| value.trim().to_owned());
+                let (status, headers, response) = if head.starts_with("get ") {
+                    observed_tx.send(protocol_header).await.unwrap();
+                    ("405 Method Not Allowed", String::new(), String::new())
+                } else if head.starts_with("delete ") {
+                    observed_tx.send(protocol_header).await.unwrap();
+                    ("202 Accepted", String::new(), String::new())
+                } else {
+                    let request: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    match method {
+                        "initialize" => {
+                            let mut result = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "result": {
+                                    "capabilities": {"tools": {}},
+                                    "serverInfo": {"name": "raw", "version": "0"}
+                                }
+                            });
+                            if let Some(version) = body_version {
+                                result["result"]["protocolVersion"] = serde_json::json!(version);
+                            }
+                            let (content_type, response) = if initialize_as_sse {
+                                ("text/event-stream", format!("data: {result}\n\n"))
+                            } else {
+                                ("application/json", result.to_string())
+                            };
+                            let headers = format!(
+                                "Content-Type: {content_type}\r\nmcp-session-id: s-1\r\n{response_version_header}"
+                            );
+                            ("200 OK", headers, response)
+                        }
+                        _ if protocol_header.as_deref() != Some(version) => {
+                            ("400 Bad Request", String::new(), String::new())
+                        }
+                        "notifications/initialized" => (
+                            "202 Accepted",
+                            response_version_header.clone(),
+                            String::new(),
+                        ),
+                        "tools/list" => (
+                            "200 OK",
+                            "Content-Type: application/json\r\n".to_owned(),
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "result": {"tools": []}
+                            })
+                            .to_string(),
+                        ),
+                        _ => panic!("unexpected request: {request}"),
+                    }
+                };
+                let raw = format!(
+                    "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                );
+                stream.write_all(raw.as_bytes()).await.unwrap();
+            }
+        });
+
+        let transport = HttpClientTransport::with_config(
+            url,
+            HttpClientConfig {
+                request_timeout: LEGACY_PROTOCOL_WAIT,
+                ..Default::default()
+            },
+        );
+        (transport, observed_rx, server)
+    }
+
+    async fn assert_legacy_protocol_header(
+        version: &'static str,
+        initialize_as_sse: bool,
+        response_version: Option<&'static str>,
+    ) {
+        let (transport, mut observed_rx, server) =
+            legacy_protocol_server(Some(version), initialize_as_sse, response_version).await;
+        let client = crate::client::McpClient::connect(transport).await.unwrap();
+        let result = client.initialize("raw-client", "1.0.0").await.unwrap();
+        assert_eq!(result.protocol_version, version);
+        assert!(client.list_tools().await.unwrap().tools.is_empty());
+        let first_get = tokio::time::timeout(LEGACY_PROTOCOL_WAIT, observed_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if initialize_as_sse {
+            assert!(
+                first_get.as_deref() == response_version || first_get.as_deref() == Some(version),
+                "the initial SSE GET uses the version available at startup: {first_get:?}"
+            );
+        } else {
+            assert_eq!(
+                first_get.as_deref(),
+                Some(version),
+                "the initial SSE GET uses the version from the buffered reply"
+            );
+        }
+        client.shutdown().await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(LEGACY_PROTOCOL_WAIT, observed_rx.recv())
+                .await
+                .unwrap(),
+            Some(Some(version.to_owned())),
+            "the session DELETE uses the negotiated version"
+        );
+        assert_eq!(
+            observed_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty),
+            "only one listener GET was sent"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_posts_use_initialize_version_without_response_header() {
+        assert_legacy_protocol_header(crate::protocol::LATEST_PROTOCOL_VERSION, false, None).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_posts_use_sse_initialize_downgrade_over_response_header() {
+        assert_legacy_protocol_header(
+            "2025-06-18",
+            true,
+            Some(crate::protocol::LATEST_PROTOCOL_VERSION),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn legacy_response_header_supplies_version_when_initialize_body_omits_it() {
+        let version = "2025-06-18";
+        let (mut transport, mut observed_rx, server) =
+            legacy_protocol_server(None, false, Some(version)).await;
+        transport
+            .send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            .await
+            .unwrap();
+        assert!(transport.initialize_reply_seen);
+        let frame = tokio::time::timeout(LEGACY_PROTOCOL_WAIT, transport.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let reply: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert!(reply["result"].get("protocolVersion").is_none());
+        assert!(!transport.initialize_version_negotiated);
+        assert_eq!(
+            transport.protocol_version.borrow().as_deref(),
+            Some(version)
+        );
+        transport
+            .send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(LEGACY_PROTOCOL_WAIT, observed_rx.recv())
+                .await
+                .unwrap(),
+            Some(Some(version.to_owned())),
+            "the initial SSE GET uses the response header"
+        );
+        transport.close().await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(LEGACY_PROTOCOL_WAIT, observed_rx.recv())
+                .await
+                .unwrap(),
+            Some(Some(version.to_owned())),
+            "the session DELETE uses the response header"
+        );
+        assert_eq!(
+            observed_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty),
+            "only one listener GET was sent"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn initialize_version_is_cleared_and_renegotiated_after_reset() {
+        let mut transport = HttpClientTransport::new("http://localhost");
+        transport.initialize_request_id = Some(RequestId::Number(1));
+        transport
+            .protocol_version
+            .send_replace(Some("2025-06-18".to_owned()));
+
+        for frame in [
+            r#"{"jsonrpc":"2.0","id":2,"result":{"protocolVersion":"2025-11-25"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+        ] {
+            transport.normalize_incoming_message(frame.to_owned());
+            assert_eq!(
+                transport.protocol_version.borrow().as_deref(),
+                Some("2025-06-18")
+            );
+            assert!(!transport.initialize_reply_seen);
+            assert!(!transport.initialize_version_negotiated);
+        }
+
+        let listener_version = transport.protocol_version.subscribe();
+        transport.normalize_incoming_message(
+            r#"{"jsonrpc":"2.0","id":"1","result":{"protocolVersion":"2025-11-25"}}"#.to_owned(),
+        );
+        assert_eq!(
+            transport.protocol_version.borrow().as_deref(),
+            Some("2025-11-25")
+        );
+        assert_eq!(listener_version.borrow().as_deref(), Some("2025-11-25"));
+        assert!(transport.initialize_reply_seen);
+        assert!(transport.initialize_version_negotiated);
+
+        transport.reset_session().await;
+        assert!(transport.protocol_version.borrow().is_none());
+        assert!(transport.initialize_request_id.is_none());
+        assert!(!transport.initialize_reply_seen);
+        assert!(!transport.initialize_version_negotiated);
+
+        transport.initialize_request_id = Some(RequestId::Number(2));
+        transport.normalize_incoming_message(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"protocolVersion":"2025-06-18"}}"#.to_owned(),
+        );
+        assert_eq!(
+            transport.protocol_version.borrow().as_deref(),
+            Some("2025-06-18")
+        );
+        assert!(transport.initialize_version_negotiated);
+    }
+
+    #[test]
+    fn initialize_reply_without_supported_version_is_terminal() {
+        for frame in [
+            r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":20251125}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2026-07-28"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1999-01-01"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"failed"}}"#,
+        ] {
+            let mut transport = HttpClientTransport::new("http://localhost");
+            transport.initialize_request_id = Some(RequestId::Number(1));
+            transport
+                .protocol_version
+                .send_replace(Some("2025-06-18".to_owned()));
+            transport.normalize_incoming_message(frame.to_owned());
+            assert!(transport.initialize_reply_seen, "{frame}");
+            assert!(!transport.initialize_version_negotiated, "{frame}");
+            assert_eq!(
+                transport.protocol_version.borrow().as_deref(),
+                Some("2025-06-18"),
+                "{frame}"
+            );
+
+            transport.normalize_incoming_message(
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}"#.to_owned(),
+            );
+            assert_eq!(
+                transport.protocol_version.borrow().as_deref(),
+                Some("2025-06-18"),
+                "{frame}"
+            );
+            assert!(!transport.initialize_version_negotiated, "{frame}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sending_another_initialize_resets_reply_tracking() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut transport = HttpClientTransport::with_client("http://127.0.0.1:1", client);
+        transport.config.request_timeout = Duration::from_secs(1);
+        transport.initialize_request_id = Some(RequestId::Number(1));
+        transport.initialize_reply_seen = true;
+        transport.initialize_version_negotiated = true;
+
+        let _ = transport
+            .send(r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}"#)
+            .await;
+
+        assert_eq!(transport.initialize_request_id, Some(RequestId::Number(2)));
+        assert!(!transport.initialize_reply_seen);
+        assert!(!transport.initialize_version_negotiated);
     }
 
     // =========================================================================
