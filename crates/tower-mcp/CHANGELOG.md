@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.29.2] - 2026-11-28
+
+### Bug Fixes
+
+- **client:** Send MCP-Protocol-Version from the negotiated initialize result ([#1718](https://github.com/joshrotenberg/tower-mcp/pull/1718))
+
+
+
 ## [0.29.1] - 2026-11-27
 
 ### Bug Fixes
